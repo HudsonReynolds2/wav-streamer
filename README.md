@@ -2,6 +2,9 @@
 Working repo for streaming .WAV files to an Aggregator from a Listener (ESP32S3) over WiFi HaLow.
 Uses Seeed studios Xiao ESP32S3Plus and Xiao WiFi HaLow Transceiver.
 
+Now we successfully get data from AudioMoth Dev (running AudioMoth-USB-Firmware) onto ESP32S3 over USB,
+and upload to cloud over WiFi HaLow in real time, no microSD involved for now.
+
 ## How to use example
 
 ## Folder contents
