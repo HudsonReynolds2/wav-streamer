@@ -19,6 +19,7 @@
 #include "esp_netif.h"
 #include "esp_http_client.h"
 #include "esp_timer.h"
+
 #include "mm_app_common.h"
 #include "mmosal.h"
 #include "mmwlan.h"
@@ -31,8 +32,8 @@
 
 /* -------------------------- HTTP streaming -------------------------- */
 
-#define SERVER_URL          "http://192.168.137.142:8000/recordings_stream"
-#define LISTENER_ID         "esp32_01"
+#define SERVER_URL          "http://192.168.137.254:8000/recordings_stream"
+#define LISTENER_ID         "esp32_01_outdoor_test"
 
 #define FRAME_HEADER_SIZE   6   // 3 bytes seq + 3 bytes length
 
