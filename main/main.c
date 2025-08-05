@@ -1,5 +1,5 @@
 // AudioMoth USB -> HTTP chunked streamer with URB-level batching
-// ESP-IDF v5.4.x compatible
+// ESP-IDF v5.1.1 compatible
 
 #include <stdio.h>
 #include <string.h>
@@ -30,6 +30,11 @@
 #include "usb/usb_helpers.h"
 #include "usb/usb_types_ch9.h"
 
+// ADD THESE INCLUDES FOR GPIO MIRRORING
+#include "driver/gpio.h"
+#include "esp_rom_gpio.h"
+#include "hal/gpio_types.h"
+#include "soc/gpio_sig_map.h"
 
 #include <sys/unistd.h>
 #include <sys/stat.h>
@@ -40,6 +45,8 @@
 #define PIN_SD_MOSI 9
 #define PIN_SD_CLK  7
 #define PIN_SD_CS   21  // HaLow CS is 4
+
+#define PIN_MIRROR_CS 6  // ADD THIS: GPIO 6 will mirror GPIO 21
 
 #define MOUNT_POINT "/sdcard"
 
@@ -418,6 +425,19 @@ static void client_task(void *arg)
 
 void app_main(void)
 {
+    // SET UP CONTINUOUS GPIO MIRRORING - GPIO 6 will always mirror GPIO 21
+    ESP_LOGI(TAG, "Setting up GPIO 6 to mirror GPIO 21");
+    
+    // First, configure both pins
+    gpio_set_direction(PIN_SD_CS, GPIO_MODE_INPUT_OUTPUT);
+    gpio_set_direction(PIN_MIRROR_CS, GPIO_MODE_OUTPUT);
+    
+    // Enable GPIO matrix routing from GPIO 21 input to GPIO 6 output
+    // This uses signal index 0x100 + gpio_num for direct GPIO routing
+    esp_rom_gpio_connect_out_signal(PIN_MIRROR_CS, 0x100 + PIN_SD_CS, false, false);
+    
+    ESP_LOGI(TAG, "GPIO 6 now mirrors GPIO 21 continuously");
+
     // Try to add MicroSD code here:
     esp_err_t ret;
 
@@ -480,6 +500,35 @@ void app_main(void)
     // Card has been initialized, print its properties
     sdmmc_card_print_info(stdout, card);
 
+    ESP_LOGI(TAG, "Testing SD card write...");
+    FILE* f = fopen(MOUNT_POINT"/test.txt", "w");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open file for writing");
+    } else {
+        fprintf(f, "SD Card test at %lld\n", esp_timer_get_time());
+        fclose(f);
+        ESP_LOGI(TAG, "File written successfully");
+    }
+
+    // Test 2: Read it back
+    ESP_LOGI(TAG, "Testing SD card read...");
+    f = fopen(MOUNT_POINT"/test.txt", "r");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open file for reading");
+    } else {
+        char line[64];
+        fgets(line, sizeof(line), f);
+        fclose(f);
+        ESP_LOGI(TAG, "Read: %s", line);
+    }
+
+    // Test 3: Create a buffer file for future use
+    f = fopen(MOUNT_POINT"/audio_buffer.bin", "wb");
+    if (f != NULL) {
+        ESP_LOGI(TAG, "Created audio buffer file");
+        fclose(f);
+    }
+
     // All done, unmount partition and disable SPI peripheral
     esp_vfs_fat_sdcard_unmount(mount_point, card);
     ESP_LOGI(TAG, "Card unmounted");
@@ -496,21 +545,107 @@ void app_main(void)
     mmwlan_set_power_save_mode(MMWLAN_PS_DISABLED);
     mmwlan_set_wnm_sleep_enabled(false);
 
-    vTaskDelay(pdMS_TO_TICKS(2000));
+    //vTaskDelay(pdMS_TO_TICKS(10000));
+    for (int i = 10; i >= 0; i--) {
+        printf("Countdown: %d\n", i);
+        vTaskDelay(pdMS_TO_TICKS(1000)); // delay 1 second
+    }
+    printf("Countdown complete: About to call app_wlan_stop()!\n");
 
-    ESP_ERROR_CHECK(stream_init());
+    app_wlan_stop();
 
-    ctrl_sem = xSemaphoreCreateBinary();
-    const usb_host_config_t host_cfg = {
-        .skip_phy_setup = false,
-        .intr_flags = 0,
-    };
-    ESP_ERROR_CHECK(usb_host_install(&host_cfg));
 
-    xTaskCreatePinnedToCore(daemon_task, "usb_daemon", 4096, NULL, 3, NULL, 0);
-    xTaskCreatePinnedToCore(client_task, "usb_client", 8192, NULL, 4, NULL, 1);
+    // Now reinitialize MicroSD:
+    spi_bus_free(host.slot);
+    ret = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize bus.");
+        return;
+    }
+    ESP_LOGI(TAG, "Re-mounting filesystem but first putting HaLow CS to High");
+    // Force HaLow module's CS high so it ignores SD card SPI traffic
+    gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
+    gpio_set_level(GPIO_NUM_4, 1);
+    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
 
-    ESP_LOGI(TAG, "AudioMoth->HTTP streaming (batched) started");
+    if (ret != ESP_OK) {
+        if (ret == ESP_FAIL) {
+            ESP_LOGE(TAG, "Failed to mount filesystem. "
+                     "If you want the card to be formatted, set the CONFIG_EXAMPLE_FORMAT_IF_MOUNT_FAILED menuconfig option.");
+        } else {
+            ESP_LOGE(TAG, "Failed to initialize the card (%s). "
+                     "Make sure SD card lines have pull-up resistors in place.", esp_err_to_name(ret));
+        }
+        return;
+    }
+    ESP_LOGI(TAG, "Filesystem mounted again");
+
+    // Card has been initialized, print its properties
+    sdmmc_card_print_info(stdout, card);
+
+    ESP_LOGI(TAG, "Testing SD card write again...");
+    f = fopen(MOUNT_POINT"/test.txt", "w");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open file for writing");
+    } else {
+        fprintf(f, "SD Card test at %lld\n", esp_timer_get_time());
+        fclose(f);
+        ESP_LOGI(TAG, "File written successfully");
+    }
+
+    // Test 2: Read it back
+    ESP_LOGI(TAG, "Testing SD card read again...");
+    f = fopen(MOUNT_POINT"/test.txt", "r");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "Failed to open file for reading");
+    } else {
+        char line[64];
+        fgets(line, sizeof(line), f);
+        fclose(f);
+        ESP_LOGI(TAG, "Read: %s", line);
+    }
+
+    // Test 3: Create a buffer file for future use
+    f = fopen(MOUNT_POINT"/audio_buffer.bin", "wb");
+    if (f != NULL) {
+        ESP_LOGI(TAG, "Created audio buffer file again");
+        fclose(f);
+    }
+
+    // All done, unmount partition and disable SPI peripheral
+    esp_vfs_fat_sdcard_unmount(mount_point, card);
+    ESP_LOGI(TAG, "Card unmounted");
+
+    //deinitialize the bus after all devices are removed
+    spi_bus_free(host.slot);
+
+
+    for (int i = 10; i >= 0; i--) {
+        printf("Countdown: %d\n", i);
+        vTaskDelay(pdMS_TO_TICKS(1000)); // delay 1 second
+    }
+    printf("Countdown complete: About to call app_wlan_start() again!\n");
+
+    app_wlan_start();
+
+    mmwlan_set_power_save_mode(MMWLAN_PS_DISABLED);
+    mmwlan_set_wnm_sleep_enabled(false);
+
+
+
+    // ESP_ERROR_CHECK(stream_init());
+
+    // ctrl_sem = xSemaphoreCreateBinary();
+    // const usb_host_config_t host_cfg = {
+    //     .skip_phy_setup = false,
+    //     .intr_flags = 0,
+    // };
+    // ESP_ERROR_CHECK(usb_host_install(&host_cfg));
+
+    // xTaskCreatePinnedToCore(daemon_task, "usb_daemon", 4096, NULL, 3, NULL, 0);
+    // xTaskCreatePinnedToCore(client_task, "usb_client", 8192, NULL, 4, NULL, 1);
+
+    // ESP_LOGI(TAG, "AudioMoth->HTTP streaming (batched) started");
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(30000));
