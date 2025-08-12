@@ -52,7 +52,7 @@
 
 /* -------------------------- HTTP streaming -------------------------- */
 
-#define SERVER_URL          "http://192.168.137.254:8000/recordings_stream"
+#define SERVER_URL          "http://192.168.137.138:8000/recordings_stream"
 #define LISTENER_ID         "esp32_01_outdoor_test"
 
 #define FRAME_HEADER_SIZE   6   // 3 bytes seq + 3 bytes length
@@ -468,7 +468,7 @@ static void force_halow_cs_high(void)
 
 /* ========================== SPI Bus Management Functions ========================== */
 
-static esp_err_t acquire_spi_bus_for_sd(void)
+static esp_err_t acquire_spi_bus_for_sd_and_stop_wifi(void)
 {
     esp_err_t ret;
     
@@ -505,7 +505,7 @@ static esp_err_t acquire_spi_bus_for_sd(void)
     return ESP_OK;
 }
 
-static esp_err_t release_spi_bus_from_sd(void)
+static esp_err_t release_spi_bus_from_sd_and_restart_wifi(void)
 {
     esp_err_t ret;
     
@@ -609,7 +609,7 @@ static esp_err_t perform_sd_card_operation(void)
     esp_err_t ret;
     
     // Acquire bus
-    ret = acquire_spi_bus_for_sd();
+    ret = acquire_spi_bus_for_sd_and_stop_wifi();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to acquire SPI bus for SD card");
         return ret;
@@ -623,7 +623,7 @@ static esp_err_t perform_sd_card_operation(void)
     }
     
     // Always release bus (this also unmounts SD)
-    release_spi_bus_from_sd();
+    release_spi_bus_from_sd_and_restart_wifi();
     
     return ret;
 }
@@ -741,14 +741,20 @@ void app_main(void)
     ESP_LOGI(TAG, "=== Starting HaLow WiFi after SD initialization ===");
     start_wifi_halow();
     
-    // Wait for WiFi to stabilize
-    countdown_delay(10, "WiFi started, waiting for connection...");
+    // Now WiFi is connected, must detect network problems in order to switch to MicroSD or not
+    // Connection, speed, access to streaming endpoint?
+    // If not good enough, must switch to MicroSD and periodically check network
+    // Use PSRAM (8MB) and the other ram to limit MicroSD wear and handle meantime: verify how to write properly to card
+    // After enough writing to a card (enough time), switch back to network and keep buffering in PSRAM
+    // If network is good, upload buffer, if network is not, time out and switch back to MicroSD
+
+
     
-    ESP_LOGI(TAG, "=== Stopping WiFi and Testing SD Card Access (test 1) ===");
-    perform_sd_card_operation();
+    //ESP_LOGI(TAG, "=== Stopping WiFi and Testing SD Card Access (test 1) ===");
+    //perform_sd_card_operation();
     
     // Wait a bit with WiFi running
-    countdown_delay(10, "WiFi running again, waiting...");
+    //countdown_delay(10, "WiFi running again, waiting...");
     
     ESP_LOGI(TAG, "=== Stopping WiFi and Testing SD Card Access (test 2) ===");
     perform_sd_card_operation();
@@ -757,22 +763,22 @@ void app_main(void)
     ESP_LOGI(TAG, "WiFi HaLow is running and ready for streaming");
     
     // Uncomment when ready to test USB streaming
-    // ESP_ERROR_CHECK(stream_init());
-    // ctrl_sem = xSemaphoreCreateBinary();
-    // const usb_host_config_t host_cfg = {
-    //     .skip_phy_setup = false,
-    //     .intr_flags = 0,
-    // };
-    // ESP_ERROR_CHECK(usb_host_install(&host_cfg));
-    // xTaskCreatePinnedToCore(daemon_task, "usb_daemon", 4096, NULL, 3, NULL, 0);
-    // xTaskCreatePinnedToCore(client_task, "usb_client", 8192, NULL, 4, NULL, 1);
-    // ESP_LOGI(TAG, "AudioMoth->HTTP streaming (batched) started");
+    ESP_ERROR_CHECK(stream_init());
+    ctrl_sem = xSemaphoreCreateBinary();
+    const usb_host_config_t host_cfg = {
+         .skip_phy_setup = false,
+         .intr_flags = 0,
+    };
+    ESP_ERROR_CHECK(usb_host_install(&host_cfg));
+    xTaskCreatePinnedToCore(daemon_task, "usb_daemon", 4096, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(client_task, "usb_client", 8192, NULL, 4, NULL, 1);
+    ESP_LOGI(TAG, "AudioMoth->HTTP streaming (batched) started");
     
     ESP_LOGI(TAG, "=== Main initialization complete ===");
     
     // Main loop - could periodically buffer to SD when network is down
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(30000));
+        vTaskDelay(pdMS_TO_TICKS(1000));
         
         // Example of periodic SD buffering (uncomment when needed):
         // if (network_is_down() || stream_ctx.is_connected == false) {
