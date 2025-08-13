@@ -17,6 +17,7 @@ idf_component_register(
         vfs
         sdmmc
         nvs_flash
+        esp_psram
 )
 # Embed the test file into the binary
 # target_add_binary_data(${COMPONENT_TARGET} "testing1.wav" BINARY)

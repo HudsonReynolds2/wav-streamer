@@ -34,7 +34,7 @@
 /* Default SSID  */
 #ifndef SSID
 /** SSID of the AP to connect to. (Do not quote; it will be stringified.) */
-#define SSID                           HT-H7608-E984 /*silex-ah-150-conn*/
+#define SSID                           HT-H7608-B81E /*silex-ah-150-conn*/
 #endif
 
 /* Default passphrase  */
@@ -54,8 +54,8 @@
  * If the @c ip.dhcp_enabled is set in the config store that will take priority */
 // #define ENABLE_DHCP                     (1)
 
-#define STATIC_LOCAL_IP "192.168.137.25"
-#define STATIC_GATEWAY "192.168.137.1"
+#define STATIC_LOCAL_IP "192.168.100.25"
+#define STATIC_GATEWAY "192.168.100.1"
 #define STATIC_NETMASK "255.255.255.0"
 
 /* Static Network configuration */
