@@ -5,13 +5,15 @@
 #include <string.h>
 #include <inttypes.h>
 #include <time.h>
+#include <dirent.h>
+#include <sys/types.h>
+#include <errno.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 
-#include <errno.h>
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_check.h"
@@ -62,14 +64,16 @@
 // Buffer configuration (easily changeable)
 #define PSRAM_INCOMING_BUFFER_SIZE  (3 * 1024 * 1024)  // 3MB for incoming USB data
 #define PSRAM_OUTGOING_BUFFER_SIZE  (3 * 1024 * 1024)  // 3MB for outgoing network data
-#define PSRAM_SWITCH_BUFFER_SIZE    (128 * 1024)       // 128KB for mode switching
+#define PSRAM_SWITCH_BUFFER_SIZE    (256 * 1024)       // 256KB for mode switching
 #define SD_BLOCK_SIZE               (32 * 1024)        // 32KB blocks for SD writes
 #define SD_MAX_WRITE_SIZE           (128 * 1024)       // Max 128KB per SD write operation
 
-// Timing configuration
+// Timing configuration (easily changeable)
+#define STREAM_RETRY_DELAY_MS       5000   // Delay between stream reconnection attempts
+#define STREAM_MAX_RETRIES          2       // Number of stream reconnection attempts before SD mode
 #define NETWORK_CHECK_INTERVAL_MS   20000  // Check network every 20 seconds when on SD
 #define CATCHUP_PAUSE_INTERVAL_MS   10000  // Pause catch-up every 10 seconds to write new data
-#define STREAM_HEALTH_CHECK_MS      10000   // Check stream health every 5 seconds
+#define STREAM_HEALTH_CHECK_MS      10000  // Check stream health every 10 seconds
 
 // Audio data rate: 96 bytes/ms = 96KB/s = 768kbps
 #define AUDIO_DATA_RATE_BPS         768000
@@ -83,6 +87,8 @@
 #define FRAME_HEADER_SIZE    6   // 3 bytes seq + 3 bytes length
 
 static const char *TAG = "am_robust_stream";
+
+static esp_err_t stream_disconnect(void);
 
 /* ========================== Type Definitions ========================== */
 
@@ -102,18 +108,32 @@ typedef struct {
 } ring_buffer_t;
 
 typedef struct {
+    char filename[256];
+    int64_t timestamp;
+} sd_file_info_t;
+
+typedef struct {
     stream_mode_t mode;
     bool network_healthy;
     bool stream_healthy;
     bool sd_mounted;
     bool wifi_connected;
+    int stream_retry_count;
     int64_t last_network_check_ms;
     int64_t last_stream_write_ms;
     int64_t last_catchup_pause_ms;
     uint32_t sequence_number;
     uint32_t sd_bytes_buffered;
-    char sd_filename[128];
-    FILE *sd_file;
+    
+    // SD file management
+    char current_write_filename[128];
+    char current_read_filename[128];
+    FILE *sd_write_file;
+    FILE *sd_read_file;
+    sd_file_info_t *sd_file_list;
+    int sd_file_count;
+    int sd_current_file_index;
+    
     SemaphoreHandle_t state_mutex;
 } system_state_t;
 
@@ -143,9 +163,14 @@ static system_state_t g_state = {
     .stream_healthy = false,
     .sd_mounted = false,
     .wifi_connected = false,
+    .stream_retry_count = 0,
     .sequence_number = 0,
     .sd_bytes_buffered = 0,
-    .sd_file = NULL
+    .sd_write_file = NULL,
+    .sd_read_file = NULL,
+    .sd_file_list = NULL,
+    .sd_file_count = 0,
+    .sd_current_file_index = 0
 };
 
 // Streaming context
@@ -328,8 +353,8 @@ static int write_chunked_end(esp_http_client_handle_t client)
 static esp_err_t stream_connect(void)
 {
     if (stream_ctx.client != NULL) {
-        ESP_LOGW(TAG, "Stream already initialized");
-        return ESP_OK;
+        ESP_LOGW(TAG, "Stream client already exists - disconnecting first");
+        stream_disconnect();
     }
 
     stream_ctx.mutex = xSemaphoreCreateMutex();
@@ -373,7 +398,10 @@ static esp_err_t stream_connect(void)
 
     stream_ctx.is_connected = true;
     
-    // FIX: Initialize stream health timestamp
+    // Reset sequence number on new connection
+    g_state.sequence_number = 0;
+    
+    // Initialize stream health timestamp
     g_state.last_stream_write_ms = esp_timer_get_time() / 1000;
     
     ESP_LOGI(TAG, "Streaming connection established");
@@ -409,6 +437,8 @@ static esp_err_t stream_send_with_header(const uint8_t *data, size_t data_len, u
     if (result < 0) {
         stream_ctx.is_connected = false;
         xSemaphoreGive(stream_ctx.mutex);
+        
+        ESP_LOGW(TAG, "Stream write failed");
         return ESP_FAIL;
     }
 
@@ -423,7 +453,9 @@ static esp_err_t stream_disconnect(void)
     ESP_LOGI(TAG, "Closing stream...");
 
     if (stream_ctx.mutex && xSemaphoreTake(stream_ctx.mutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
-        write_chunked_end(stream_ctx.client);
+        if (stream_ctx.is_connected) {
+            write_chunked_end(stream_ctx.client);
+        }
         
         esp_http_client_close(stream_ctx.client);
         esp_http_client_cleanup(stream_ctx.client);
@@ -473,6 +505,113 @@ static void force_halow_cs_high(void)
     gpio_set_level(GPIO_NUM_4, 1);
 }
 
+// Compare function for sorting files by timestamp
+static int compare_files_by_timestamp(const void *a, const void *b)
+{
+    const sd_file_info_t *file_a = (const sd_file_info_t *)a;
+    const sd_file_info_t *file_b = (const sd_file_info_t *)b;
+    
+    if (file_a->timestamp < file_b->timestamp) return -1;
+    if (file_a->timestamp > file_b->timestamp) return 1;
+    return 0;
+}
+
+// Scan SD card for buffered files
+static esp_err_t sd_scan_buffered_files(void)
+{
+    DIR *dir;
+    struct dirent *entry;
+    struct stat file_stat;
+    char full_path[512];  // Increased buffer size to 512 bytes
+    
+    // Check if SD is mounted
+    if (!g_state.sd_mounted) {
+        ESP_LOGW(TAG, "SD card not mounted, cannot scan for files");
+        return ESP_FAIL;
+    }
+    
+    // Free previous list if exists
+    if (g_state.sd_file_list) {
+        free(g_state.sd_file_list);
+        g_state.sd_file_list = NULL;
+    }
+    g_state.sd_file_count = 0;
+    g_state.sd_current_file_index = 0;
+    
+    dir = opendir(MOUNT_POINT);
+    if (dir == NULL) {
+        ESP_LOGE(TAG, "Failed to open SD card directory");
+        return ESP_FAIL;
+    }
+    
+    // Count audio buffer files
+    int file_count = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strstr(entry->d_name, "audio_buffer_") != NULL && strstr(entry->d_name, ".bin") != NULL) {
+            file_count++;
+        }
+    }
+    
+    if (file_count == 0) {
+        closedir(dir);
+        ESP_LOGI(TAG, "No buffered audio files found on SD card");
+        return ESP_OK;
+    }
+    
+    ESP_LOGI(TAG, "Found %d buffered audio files on SD card", file_count);
+    
+    // Allocate list
+    g_state.sd_file_list = (sd_file_info_t *)malloc(sizeof(sd_file_info_t) * file_count);
+    if (!g_state.sd_file_list) {
+        closedir(dir);
+        ESP_LOGE(TAG, "Failed to allocate memory for file list");
+        return ESP_ERR_NO_MEM;
+    }
+    
+    // Rewind directory and populate list
+    rewinddir(dir);
+    int index = 0;
+    while ((entry = readdir(dir)) != NULL && index < file_count) {
+        if (strstr(entry->d_name, "audio_buffer_") != NULL && strstr(entry->d_name, ".bin") != NULL) {
+            // Check if the filename is too long
+            if (strlen(entry->d_name) > 400) {  // Leave room for mount point and slash
+                ESP_LOGW(TAG, "Filename too long, skipping: %.50s...", entry->d_name);
+                continue;
+            }
+            
+            int ret = snprintf(full_path, sizeof(full_path), "%s/%s", MOUNT_POINT, entry->d_name);
+            if (ret >= sizeof(full_path)) {
+                ESP_LOGW(TAG, "Path truncated, skipping file: %s", entry->d_name);
+                continue;
+            }
+            
+            if (stat(full_path, &file_stat) == 0) {
+                strncpy(g_state.sd_file_list[index].filename, full_path, sizeof(g_state.sd_file_list[index].filename) - 1);
+                g_state.sd_file_list[index].filename[sizeof(g_state.sd_file_list[index].filename) - 1] = '\0';  // Ensure null termination
+                
+                // Extract timestamp from filename (audio_buffer_TIMESTAMP.bin)
+                char *timestamp_str = strstr(entry->d_name, "audio_buffer_") + strlen("audio_buffer_");
+                g_state.sd_file_list[index].timestamp = atoll(timestamp_str);
+                
+                index++;
+            }
+        }
+    }
+    
+    closedir(dir);
+    g_state.sd_file_count = index;
+    
+    // Sort files by timestamp
+    qsort(g_state.sd_file_list, g_state.sd_file_count, sizeof(sd_file_info_t), compare_files_by_timestamp);
+    
+    ESP_LOGI(TAG, "Sorted %d buffered files for upload", g_state.sd_file_count);
+    for (int i = 0; i < g_state.sd_file_count; i++) {
+        ESP_LOGI(TAG, "  [%d] %s (timestamp: %lld)", i, g_state.sd_file_list[i].filename, g_state.sd_file_list[i].timestamp);
+    }
+    
+    return ESP_OK;
+}
+
 static esp_err_t sd_card_mount(void)
 {
     esp_err_t ret;
@@ -508,6 +647,9 @@ static esp_err_t sd_card_mount(void)
     if (ret == ESP_OK) {
         g_state.sd_mounted = true;
         ESP_LOGI(TAG, "SD card mounted successfully");
+        
+        // Scan for existing buffered files
+        sd_scan_buffered_files();
     } else {
         ESP_LOGE(TAG, "Failed to mount SD card: %s", esp_err_to_name(ret));
         spi_bus_free(sd_host.slot);
@@ -524,11 +666,21 @@ static esp_err_t sd_card_unmount(void)
     
     ESP_LOGI(TAG, "Unmounting SD card...");
     
-    // Close any open file
-    if (g_state.sd_file) {
-        fclose(g_state.sd_file);
-        g_state.sd_file = NULL;
+    // Close any open files - CRITICAL to do this before unmounting
+    if (g_state.sd_write_file) {
+        fclose(g_state.sd_write_file);
+        g_state.sd_write_file = NULL;
+        ESP_LOGI(TAG, "Closed write file");
     }
+    if (g_state.sd_read_file) {
+        fclose(g_state.sd_read_file);
+        g_state.sd_read_file = NULL;
+        ESP_LOGI(TAG, "Closed read file");
+    }
+    
+    // Clear filename buffers
+    memset(g_state.current_write_filename, 0, sizeof(g_state.current_write_filename));
+    memset(g_state.current_read_filename, 0, sizeof(g_state.current_read_filename));
     
     esp_err_t ret = esp_vfs_fat_sdcard_unmount(MOUNT_POINT, sd_card);
     if (ret == ESP_OK) {
@@ -552,72 +704,156 @@ static esp_err_t sd_write_audio_data(const uint8_t *data, size_t len)
     }
     
     // Open file if not already open
-    if (!g_state.sd_file) {
+    if (!g_state.sd_write_file) {
         // Generate filename with timestamp
         int64_t timestamp = esp_timer_get_time() / 1000000; // Convert to seconds
-        snprintf(g_state.sd_filename, sizeof(g_state.sd_filename),
+        snprintf(g_state.current_write_filename, sizeof(g_state.current_write_filename),
                  MOUNT_POINT"/audio_buffer_%lld.bin", timestamp);
         
-        // FIX: Use "wb" mode and ensure directory exists
-        g_state.sd_file = fopen(g_state.sd_filename, "wb");  // Changed from "ab" to "wb"
-        if (!g_state.sd_file) {
-            ESP_LOGE(TAG, "Failed to open SD file for writing: %s", g_state.sd_filename);
+        // Make sure to close any stale file handle first
+        if (g_state.sd_write_file) {
+            fclose(g_state.sd_write_file);
+            g_state.sd_write_file = NULL;
+        }
+        
+        g_state.sd_write_file = fopen(g_state.current_write_filename, "wb");
+        if (!g_state.sd_write_file) {
+            ESP_LOGE(TAG, "Failed to open SD file for writing: %s", g_state.current_write_filename);
             ESP_LOGE(TAG, "errno: %d (%s)", errno, strerror(errno));
             
-            // Try to create a simpler filename
-            snprintf(g_state.sd_filename, sizeof(g_state.sd_filename), MOUNT_POINT"/buffer.bin");
-            g_state.sd_file = fopen(g_state.sd_filename, "wb");
-            if (!g_state.sd_file) {
-                ESP_LOGE(TAG, "Failed to open simplified SD file: %s", g_state.sd_filename);
+            // Try with a simpler filename
+            static int file_counter = 0;
+            snprintf(g_state.current_write_filename, sizeof(g_state.current_write_filename),
+                     MOUNT_POINT"/audio_%d.bin", file_counter++);
+            
+            g_state.sd_write_file = fopen(g_state.current_write_filename, "wb");
+            if (!g_state.sd_write_file) {
+                ESP_LOGE(TAG, "Failed to open simplified SD file: %s", g_state.current_write_filename);
                 return ESP_FAIL;
             }
         }
-        ESP_LOGI(TAG, "Opened SD file: %s", g_state.sd_filename);
+        ESP_LOGI(TAG, "Opened SD file for writing: %s", g_state.current_write_filename);
     }
     
     // Write data in chunks up to SD_MAX_WRITE_SIZE
     size_t written = 0;
     while (written < len) {
         size_t chunk_size = (len - written) > SD_MAX_WRITE_SIZE ? SD_MAX_WRITE_SIZE : (len - written);
-        size_t result = fwrite(data + written, 1, chunk_size, g_state.sd_file);
+        size_t result = fwrite(data + written, 1, chunk_size, g_state.sd_write_file);
         if (result != chunk_size) {
             ESP_LOGE(TAG, "SD write failed: wrote %zu of %zu bytes, errno: %d (%s)", 
                      result, chunk_size, errno, strerror(errno));
+            // Close the failed file
+            fclose(g_state.sd_write_file);
+            g_state.sd_write_file = NULL;
             return ESP_FAIL;
         }
         written += result;
     }
     
     // Flush to ensure data is written
-    if (fflush(g_state.sd_file) != 0) {
+    if (fflush(g_state.sd_write_file) != 0) {
         ESP_LOGE(TAG, "SD flush failed: errno: %d (%s)", errno, strerror(errno));
+        // Close the failed file
+        fclose(g_state.sd_write_file);
+        g_state.sd_write_file = NULL;
         return ESP_FAIL;
     }
     
     g_state.sd_bytes_buffered += written;
     g_total_bytes_sd_written += written;
     
+    // Periodically close and reopen file to prevent issues
+    static size_t bytes_in_current_file = 0;
+    bytes_in_current_file += written;
+    if (bytes_in_current_file > (10 * 1024 * 1024)) { // 10MB per file
+        ESP_LOGI(TAG, "Rotating SD file after 10MB");
+        fclose(g_state.sd_write_file);
+        g_state.sd_write_file = NULL;
+        bytes_in_current_file = 0;
+    }
+    
+    return ESP_OK;
+}
+
+static esp_err_t sd_open_next_file_for_reading(void)
+{
+    // Close current read file if open
+    if (g_state.sd_read_file) {
+        fclose(g_state.sd_read_file);
+        g_state.sd_read_file = NULL;
+        
+        // Delete the file we just finished reading
+        if (strlen(g_state.current_read_filename) > 0) {
+            ESP_LOGI(TAG, "Deleting uploaded file: %s", g_state.current_read_filename);
+            unlink(g_state.current_read_filename);
+        }
+    }
+    
+    // Check if we have more files to read
+    if (g_state.sd_current_file_index >= g_state.sd_file_count) {
+        ESP_LOGI(TAG, "All buffered files have been uploaded");
+        // Reset file list
+        if (g_state.sd_file_list) {
+            free(g_state.sd_file_list);
+            g_state.sd_file_list = NULL;
+        }
+        g_state.sd_file_count = 0;
+        g_state.sd_current_file_index = 0;
+        g_state.sd_bytes_buffered = 0;
+        return ESP_OK;  // No more files
+    }
+    
+    // Open next file
+    strncpy(g_state.current_read_filename, g_state.sd_file_list[g_state.sd_current_file_index].filename, 
+            sizeof(g_state.current_read_filename) - 1);
+    
+    g_state.sd_read_file = fopen(g_state.current_read_filename, "rb");
+    if (!g_state.sd_read_file) {
+        ESP_LOGE(TAG, "Failed to open SD file for reading: %s", g_state.current_read_filename);
+        g_state.sd_current_file_index++;
+        return ESP_FAIL;
+    }
+    
+    ESP_LOGI(TAG, "Opened file [%d/%d] for reading: %s", 
+             g_state.sd_current_file_index + 1, g_state.sd_file_count, g_state.current_read_filename);
+    
+    g_state.sd_current_file_index++;
     return ESP_OK;
 }
 
 static esp_err_t sd_read_audio_data(uint8_t *data, size_t len, size_t *bytes_read)
 {
-    if (!g_state.sd_mounted || !g_state.sd_file || !data) {
+    if (!g_state.sd_mounted || !data) {
         return ESP_FAIL;
     }
     
-    *bytes_read = fread(data, 1, len, g_state.sd_file);
-    if (*bytes_read == 0 && feof(g_state.sd_file)) {
-        // Reached end of file, we're caught up
-        ESP_LOGI(TAG, "Caught up with SD buffer, deleting file");
-        fclose(g_state.sd_file);
-        g_state.sd_file = NULL;
-        unlink(g_state.sd_filename);
-        g_state.sd_bytes_buffered = 0;
-        return ESP_OK;
+    *bytes_read = 0;
+    
+    // If no read file is open, try to open the next one
+    if (!g_state.sd_read_file) {
+        if (sd_open_next_file_for_reading() != ESP_OK) {
+            return ESP_OK;  // No more files, but not an error
+        }
     }
     
-    return (*bytes_read > 0) ? ESP_OK : ESP_FAIL;
+    // Read from current file
+    *bytes_read = fread(data, 1, len, g_state.sd_read_file);
+    
+    if (*bytes_read == 0 && feof(g_state.sd_read_file)) {
+        // Current file finished, try next one
+        ESP_LOGI(TAG, "Finished reading current file");
+        if (sd_open_next_file_for_reading() == ESP_OK && g_state.sd_read_file) {
+            // Try reading from the new file
+            *bytes_read = fread(data, 1, len, g_state.sd_read_file);
+        }
+    }
+    
+    if (g_state.sd_bytes_buffered >= *bytes_read) {
+        g_state.sd_bytes_buffered -= *bytes_read;
+    }
+    
+    return (*bytes_read > 0) ? ESP_OK : ESP_OK;  // Always return OK, 0 bytes means no more data
 }
 
 /* ========================== Network Management ========================== */
@@ -666,7 +902,6 @@ static bool check_network_health(void)
         int64_t now = esp_timer_get_time() / 1000;
         int64_t time_since_last_write = now - g_state.last_stream_write_ms;
         
-        // FIX: Only check stream health if enough time has passed AND we should have sent data
         // Give grace period of 30 seconds after connection, then check if stalled
         if (time_since_last_write > 30000) {  // 30 seconds grace period
             // Check if incoming buffer has data that should be streaming
@@ -683,6 +918,29 @@ static bool check_network_health(void)
 }
 
 /* ========================== Mode Management ========================== */
+
+static esp_err_t attempt_stream_reconnection(void)
+{
+    ESP_LOGI(TAG, "Attempting to reconnect stream (attempt %d/%d)", 
+             g_state.stream_retry_count + 1, STREAM_MAX_RETRIES);
+    
+    // Disconnect existing stream
+    stream_disconnect();
+    
+    // Wait before retry
+    vTaskDelay(pdMS_TO_TICKS(STREAM_RETRY_DELAY_MS));
+    
+    // Try to reconnect
+    if (stream_connect() == ESP_OK) {
+        ESP_LOGI(TAG, "Stream reconnection successful");
+        g_state.stream_retry_count = 0;
+        g_state.stream_healthy = true;
+        return ESP_OK;
+    }
+    
+    g_state.stream_retry_count++;
+    return ESP_FAIL;
+}
 
 static esp_err_t switch_to_streaming_mode(void)
 {
@@ -706,16 +964,23 @@ static esp_err_t switch_to_streaming_mode(void)
         }
     }
     
-    // Unmount SD if mounted
-    if (g_state.sd_mounted) {
+    // Close SD write file if open (keep read file for catch-up if needed)
+    if (g_state.sd_write_file) {
+        fclose(g_state.sd_write_file);
+        g_state.sd_write_file = NULL;
+    }
+    
+    // Unmount SD if mounted and no files to catch up
+    if (g_state.sd_mounted && g_state.sd_file_count == 0) {
         sd_card_unmount();
     }
     
     g_state.mode = MODE_STREAMING;
     g_state.stream_healthy = true;
-    g_state.network_healthy = true;  // FIX: Set network healthy when switching to streaming
+    g_state.network_healthy = true;
+    g_state.stream_retry_count = 0;
     
-    // FIX: Reset health check timestamp
+    // Reset health check timestamp
     g_state.last_stream_write_ms = esp_timer_get_time() / 1000;
     
     xSemaphoreGive(g_state.state_mutex);
@@ -744,6 +1009,7 @@ static esp_err_t switch_to_sd_mode(void)
     
     g_state.mode = MODE_SD_BUFFERING;
     g_state.last_network_check_ms = esp_timer_get_time() / 1000;
+    g_state.stream_retry_count = 0;
     
     xSemaphoreGive(g_state.state_mutex);
     
@@ -757,22 +1023,20 @@ static esp_err_t switch_to_catchup_mode(void)
     
     xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
     
-    // Need to have SD file to catch up from
-    if (!g_state.sd_file || g_state.sd_bytes_buffered == 0) {
+    // Need to have SD files to catch up from
+    if (g_state.sd_file_count == 0) {
         ESP_LOGI(TAG, "No SD data to catch up, going directly to streaming");
         xSemaphoreGive(g_state.state_mutex);
         return switch_to_streaming_mode();
     }
     
-    // Reopen file for reading from beginning
-    if (g_state.sd_file) {
-        fclose(g_state.sd_file);
-    }
-    g_state.sd_file = fopen(g_state.sd_filename, "rb");
-    if (!g_state.sd_file) {
-        ESP_LOGE(TAG, "Failed to open SD file for reading");
-        xSemaphoreGive(g_state.state_mutex);
-        return ESP_FAIL;
+    // Ensure we can read from SD
+    if (!g_state.sd_read_file) {
+        if (sd_open_next_file_for_reading() != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to open SD file for catch-up");
+            xSemaphoreGive(g_state.state_mutex);
+            return ESP_FAIL;
+        }
     }
     
     g_state.mode = MODE_CATCHING_UP;
@@ -798,6 +1062,12 @@ static void stream_manager_task(void *arg)
     }
     ESP_LOGI(TAG, "Work buffer allocated: %d KB in internal RAM", SD_BLOCK_SIZE / 1024);
     
+    // Check if we need to catch up from boot
+    if (g_state.sd_file_count > 0) {
+        ESP_LOGI(TAG, "Found %d buffered files on boot, switching to catch-up mode", g_state.sd_file_count);
+        switch_to_catchup_mode();
+    }
+    
     while (1) {
         xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
         stream_mode_t current_mode = g_state.mode;
@@ -815,11 +1085,27 @@ static void stream_manager_task(void *arg)
                             g_state.sequence_number = (g_state.sequence_number + 1) & 0xFFFFFF;
                             g_state.last_stream_write_ms = esp_timer_get_time() / 1000;
                             g_total_bytes_sent += bytes_read;
+                            
+                            // Reset retry count on successful send
+                            g_state.stream_retry_count = 0;
                         } else {
-                            // Stream failed, switch to SD mode
-                            ESP_LOGE(TAG, "Stream write failed, switching to SD mode");
+                            // Stream failed, try to reconnect
+                            ESP_LOGE(TAG, "Stream write failed (retry %d/%d)", g_state.stream_retry_count, STREAM_MAX_RETRIES);
                             g_state.stream_healthy = false;
-                            switch_to_sd_mode();
+                            
+                            // Put data back into buffer so we don't lose it
+                            ring_buffer_write(g_incoming_buffer, work_buffer, bytes_read);
+                            
+                            if (g_state.stream_retry_count < STREAM_MAX_RETRIES) {
+                                if (attempt_stream_reconnection() != ESP_OK) {
+                                    if (g_state.stream_retry_count >= STREAM_MAX_RETRIES) {
+                                        ESP_LOGE(TAG, "Max stream retry attempts reached, switching to SD mode");
+                                        switch_to_sd_mode();
+                                    }
+                                }
+                            } else {
+                                switch_to_sd_mode();
+                            }
                         }
                     }
                 } else {
@@ -829,125 +1115,178 @@ static void stream_manager_task(void *arg)
             }
             
             case MODE_SD_BUFFERING: {
-                // Read from incoming buffer and write to SD in blocks to protect microSD
+                // Read from incoming buffer and write to SD
                 size_t available = ring_buffer_get_data_size(g_incoming_buffer);
                 size_t free_space = ring_buffer_get_free_space(g_incoming_buffer);
                 bool did_work = false;
                 
                 if (available >= SD_BLOCK_SIZE) {
-                    // Write full blocks (preferred - protects SD card)
+                    // Write full blocks
                     size_t bytes_read = ring_buffer_read(g_incoming_buffer, work_buffer, SD_BLOCK_SIZE);
                     if (bytes_read > 0) {
                         ESP_LOGI(TAG, "Writing %zu bytes to SD (full block)", bytes_read);
                         esp_err_t err = sd_write_audio_data(work_buffer, bytes_read);
                         if (err != ESP_OK) {
                             ESP_LOGE(TAG, "SD write failed!");
-                            // Try to reconnect to network as fallback
-                            if (wifi_reconnect() == ESP_OK && stream_connect() == ESP_OK) {
-                                switch_to_streaming_mode();
+                            // SD failure is critical - only try network if buffer has space
+                            if (free_space > (PSRAM_INCOMING_BUFFER_SIZE / 2)) {
+                                ESP_LOGW(TAG, "Attempting emergency network fallback due to SD failure");
+                                
+                                // Put data back in buffer before switching
+                                ring_buffer_write(g_incoming_buffer, work_buffer, bytes_read);
+                                
+                                // Properly unmount SD before trying network
+                                sd_card_unmount();
+                                
+                                if (wifi_reconnect() == ESP_OK && stream_connect() == ESP_OK) {
+                                    switch_to_streaming_mode();
+                                } else {
+                                    // Network failed too, go back to SD
+                                    switch_to_sd_mode();
+                                }
+                            } else {
+                                // Buffer too full, keep trying SD
+                                ESP_LOGE(TAG, "Buffer nearly full, retrying SD write");
                             }
+                        } else {
+                            did_work = true;
                         }
-                        did_work = true;
                     }
                 } else if (available > 0 && free_space < SD_BLOCK_SIZE) {
                     // Buffer is getting full, flush to prevent overflow
                     size_t bytes_read = ring_buffer_read(g_incoming_buffer, work_buffer, available);
                     if (bytes_read > 0) {
-                        ESP_LOGW(TAG, "Emergency flush: writing %zu bytes to SD (buffer nearly full)", bytes_read);
-                        sd_write_audio_data(work_buffer, bytes_read);
-                        did_work = true;
+                        ESP_LOGW(TAG, "Emergency flush: writing %zu bytes to SD", bytes_read);
+                        esp_err_t err = sd_write_audio_data(work_buffer, bytes_read);
+                        if (err != ESP_OK) {
+                            ESP_LOGE(TAG, "Emergency flush failed!");
+                            // Put data back
+                            ring_buffer_write(g_incoming_buffer, work_buffer, bytes_read);
+                        } else {
+                            did_work = true;
+                        }
                     }
                 }
                 
-                // CRITICAL FIX: Always yield to prevent watchdog, regardless of work done
-                if (did_work) {
-                    vTaskDelay(pdMS_TO_TICKS(1));   // Brief yield after work
-                } else {
-                    // No work done - yield longer to prevent busy loop
-                    ESP_LOGD(TAG, "Waiting for more data: %zu/%zu bytes", available, SD_BLOCK_SIZE);
-                    vTaskDelay(pdMS_TO_TICKS(10));  // Wait for more data to accumulate
-                }
-                
-                // Periodically check network
+                // Check if it's time to try reconnecting
                 int64_t now_ms = esp_timer_get_time() / 1000;
-                if (now_ms - g_state.last_network_check_ms > NETWORK_CHECK_INTERVAL_MS) {
-                    ESP_LOGI(TAG, "Checking network availability...");
+                if ((now_ms - g_state.last_network_check_ms) > NETWORK_CHECK_INTERVAL_MS) {
+                    ESP_LOGI(TAG, "Attempting to reconnect to network...");
                     g_state.last_network_check_ms = now_ms;
                     
-                    if (wifi_reconnect() == ESP_OK && stream_connect() == ESP_OK) {
-                        ESP_LOGI(TAG, "Network restored, switching to catch-up mode");
-                        
-                        // Close SD file for writing, will reopen for reading
-                        if (g_state.sd_file) {
-                            fclose(g_state.sd_file);
-                            g_state.sd_file = NULL;
-                        }
-                        
-                        switch_to_catchup_mode();
+                    // Close write file before unmounting
+                    if (g_state.sd_write_file) {
+                        fclose(g_state.sd_write_file);
+                        g_state.sd_write_file = NULL;
                     }
+                    
+                    // Rescan files before switching modes
+                    sd_scan_buffered_files();
+                    
+                    // Properly unmount SD before network attempt
+                    sd_card_unmount();
+                    
+                    if (wifi_reconnect() == ESP_OK && stream_connect() == ESP_OK) {
+                        if (g_state.sd_file_count > 0) {
+                            // Need to remount SD for reading
+                            sd_card_mount();
+                            switch_to_catchup_mode();
+                        } else {
+                            switch_to_streaming_mode();
+                        }
+                    } else {
+                        // Failed to reconnect, go back to SD
+                        sd_card_mount();
+                    }
+                }
+                
+                // Yield to prevent watchdog
+                if (did_work) {
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                } else {
+                    vTaskDelay(pdMS_TO_TICKS(10));
                 }
                 break;
             }
             
             case MODE_CATCHING_UP: {
-                // Need to balance uploading old data with processing new data
-                int64_t now_ms = esp_timer_get_time() / 1000;
-                bool need_pause = (now_ms - g_state.last_catchup_pause_ms) > CATCHUP_PAUSE_INTERVAL_MS;
-                
-                // Check incoming buffer fill level
+                // Balance uploading old data with processing new data
                 size_t incoming_available = ring_buffer_get_data_size(g_incoming_buffer);
                 size_t incoming_free = ring_buffer_get_free_space(g_incoming_buffer);
                 
-                // If incoming buffer is getting full or it's time to pause, process new data first
-                if (incoming_free < (PSRAM_INCOMING_BUFFER_SIZE / 4) || need_pause) {
-                    ESP_LOGI(TAG, "Pausing catch-up to process incoming data");
+                // If incoming buffer is getting full, write it to SD
+                if (incoming_free < (PSRAM_INCOMING_BUFFER_SIZE / 4)) {
+                    ESP_LOGI(TAG, "Incoming buffer filling during catch-up, writing to SD");
                     
-                    // Switch back to SD mode temporarily to dump incoming buffer
-                    sd_card_unmount();
-                    
-                    if (sd_card_mount() == ESP_OK) {
-                        // Append new data to the same file
-                        g_state.sd_file = fopen(g_state.sd_filename, "ab");
-                        if (g_state.sd_file) {
-                            while (incoming_available >= SD_BLOCK_SIZE) {
-                                size_t bytes_read = ring_buffer_read(g_incoming_buffer, work_buffer, SD_BLOCK_SIZE);
-                                sd_write_audio_data(work_buffer, bytes_read);
-                                incoming_available = ring_buffer_get_data_size(g_incoming_buffer);
-                            }
-                            fclose(g_state.sd_file);
-                        }
+                    // Need to ensure we have SD write capability
+                    if (!g_state.sd_write_file) {
+                        // Generate new filename for incoming data during catch-up
+                        int64_t timestamp = esp_timer_get_time() / 1000000;
+                        snprintf(g_state.current_write_filename, sizeof(g_state.current_write_filename),
+                                 MOUNT_POINT"/audio_buffer_%lld.bin", timestamp);
                         
-                        // Reopen for reading where we left off
-                        g_state.sd_file = fopen(g_state.sd_filename, "rb");
-                        // Seek to where we were
-                        // This is simplified - in production you'd track the read position
+                        g_state.sd_write_file = fopen(g_state.current_write_filename, "wb");
+                        if (!g_state.sd_write_file) {
+                            ESP_LOGE(TAG, "Failed to open SD file for catch-up overflow");
+                            // Critical error - switch back to SD mode
+                            switch_to_sd_mode();
+                            continue;
+                        }
+                        ESP_LOGI(TAG, "Opened new SD file for catch-up overflow: %s", g_state.current_write_filename);
                     }
                     
-                    g_state.last_catchup_pause_ms = now_ms;
-                } else {
-                    // Upload from SD to network
-                    size_t bytes_read;
-                    esp_err_t err = sd_read_audio_data(work_buffer, SD_BLOCK_SIZE, &bytes_read);
+                    // Write incoming data to SD
+                    while (incoming_available >= SD_BLOCK_SIZE) {
+                        size_t bytes_read = ring_buffer_read(g_incoming_buffer, work_buffer, SD_BLOCK_SIZE);
+                        if (bytes_read > 0) {
+                            sd_write_audio_data(work_buffer, bytes_read);
+                        }
+                        incoming_available = ring_buffer_get_data_size(g_incoming_buffer);
+                    }
                     
-                    if (err == ESP_OK && bytes_read > 0) {
-                        err = stream_send_with_header(work_buffer, bytes_read, g_state.sequence_number);
-                        if (err == ESP_OK) {
-                            g_state.sequence_number = (g_state.sequence_number + 1) & 0xFFFFFF;
-                            g_state.last_stream_write_ms = now_ms;
-                            g_total_bytes_sent += bytes_read;
-                            g_state.sd_bytes_buffered -= bytes_read;
+                    // Close write file and add to catch-up list
+                    if (g_state.sd_write_file) {
+                        fclose(g_state.sd_write_file);
+                        g_state.sd_write_file = NULL;
+                        // Rescan to include the new file
+                        sd_scan_buffered_files();
+                    }
+                }
+                
+                // Upload from SD to network
+                size_t bytes_read;
+                esp_err_t err = sd_read_audio_data(work_buffer, SD_BLOCK_SIZE, &bytes_read);
+                
+                if (err == ESP_OK && bytes_read > 0) {
+                    err = stream_send_with_header(work_buffer, bytes_read, g_state.sequence_number);
+                    if (err == ESP_OK) {
+                        g_state.sequence_number = (g_state.sequence_number + 1) & 0xFFFFFF;
+                        g_state.last_stream_write_ms = esp_timer_get_time() / 1000;
+                        g_total_bytes_sent += bytes_read;
+                    } else {
+                        ESP_LOGE(TAG, "Stream failed during catch-up");
+                        g_state.stream_healthy = false;
+                        
+                        // Try to reconnect
+                        if (g_state.stream_retry_count < STREAM_MAX_RETRIES) {
+                            if (attempt_stream_reconnection() != ESP_OK) {
+                                if (g_state.stream_retry_count >= STREAM_MAX_RETRIES) {
+                                    switch_to_sd_mode();
+                                }
+                            }
                         } else {
-                            ESP_LOGE(TAG, "Stream failed during catch-up, reverting to SD mode");
                             switch_to_sd_mode();
                         }
-                    } else if (bytes_read == 0) {
-                        // Caught up!
-                        ESP_LOGI(TAG, "Caught up with SD buffer, switching to streaming mode");
+                    }
+                } else if (bytes_read == 0) {
+                    // No more data in files, check if we're completely caught up
+                    if (g_state.sd_current_file_index >= g_state.sd_file_count) {
+                        ESP_LOGI(TAG, "Caught up with all SD buffers, switching to streaming mode");
                         switch_to_streaming_mode();
                     }
                 }
                 
-                vTaskDelay(pdMS_TO_TICKS(1));  // Always yield in catch-up mode
+                vTaskDelay(pdMS_TO_TICKS(1));
                 break;
             }
         }
@@ -976,13 +1315,13 @@ static void network_monitor_task(void *arg)
                 g_state.network_healthy = false;
                 
                 if (current_mode == MODE_STREAMING) {
-                    switch_to_sd_mode();
+                    // Don't immediately switch to SD, let stream_manager_task handle retries
+                    g_state.stream_healthy = false;
                 }
             }
         }
         
-        // FIX: Increase check interval to reduce false positives
-        vTaskDelay(pdMS_TO_TICKS(30000));  // Changed from 10000 to 30000 (30 seconds)
+        vTaskDelay(pdMS_TO_TICKS(30000));  // 30 seconds
     }
     
     vTaskDelete(NULL);
@@ -1240,7 +1579,7 @@ static esp_err_t initialize_psram_buffers(void)
         return ESP_ERR_NO_MEM;
     }
     
-    // Allocate switch buffer (128KB) explicitly in PSRAM
+    // Allocate switch buffer (256KB) explicitly in PSRAM
     g_switch_buffer = (uint8_t*)heap_caps_malloc(PSRAM_SWITCH_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
     if (!g_switch_buffer) {
         ESP_LOGE(TAG, "Failed to allocate switch buffer in PSRAM");
@@ -1268,20 +1607,14 @@ static esp_err_t initialize_sd_card_first(void)
     
     ESP_LOGI(TAG, "Initializing SD card first (before HaLow)...");
     
-    // MANDATORY SEQUENCE - DO NOT CHANGE ORDER:
-    // 1. Force release SPI bus in case another driver grabbed it
-    // 2. Hold HaLow CS high to prevent conflicts
-    // 3. Initialize and test SD card
-    // 4. Free bus for HaLow to use
-    
-    // Step 1: Force release SPI bus
-    ESP_LOGI(TAG, "Freeing SPI bus before SD card init (mandatory step)");
+    // Force release SPI bus
+    ESP_LOGI(TAG, "Freeing SPI bus before SD card init");
     spi_bus_free(sd_host.slot);
     
-    // Step 2: Force HaLow module's CS high
+    // Force HaLow module's CS high
     force_halow_cs_high();
     
-    // Step 3: Initialize SPI bus for SD card
+    // Initialize SPI bus for SD card
     ret = spi_bus_initialize(sd_host.slot, &spi_bus_cfg, SPI_DMA_CH_AUTO);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to initialize SPI bus for SD: %s", esp_err_to_name(ret));
@@ -1301,6 +1634,9 @@ static esp_err_t initialize_sd_card_first(void)
         ESP_LOGI(TAG, "SD card mounted successfully on startup");
         sdmmc_card_print_info(stdout, sd_card);
         
+        // Scan for existing buffered files
+        sd_scan_buffered_files();
+        
         // Test write
         FILE* f = fopen(MOUNT_POINT"/test.txt", "w");
         if (f != NULL) {
@@ -1309,18 +1645,18 @@ static esp_err_t initialize_sd_card_first(void)
             ESP_LOGI(TAG, "SD card write test successful");
         }
         
-        // Unmount SD card
+        // Unmount SD card (but keep file list in memory)
         ret = esp_vfs_fat_sdcard_unmount(MOUNT_POINT, sd_card);
         if (ret == ESP_OK) {
             g_state.sd_mounted = false;
             sd_card = NULL;
-            ESP_LOGI(TAG, "SD card unmounted after initial test");
+            ESP_LOGI(TAG, "SD card unmounted after initial scan");
         }
     } else {
         ESP_LOGE(TAG, "Failed to mount SD card on startup: %s", esp_err_to_name(ret));
     }
     
-    // Step 4: Free the SPI bus so HaLow can use it
+    // Free the SPI bus so HaLow can use it
     ret = spi_bus_free(sd_host.slot);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Issue freeing SPI bus after SD init: %s", esp_err_to_name(ret));
@@ -1346,22 +1682,22 @@ static void initialize_system(void)
         return;
     }
     
-    // Set up GPIO mirroring (CS pin mirroring for debugging)
+    // Set up GPIO mirroring
     setup_gpio_mirroring();
     
     // Initialize event loop
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     
-    // MANDATORY: Initialize SD card FIRST before HaLow
+    // Initialize SD card FIRST and scan for buffered files
     initialize_sd_card_first();
     
     // Small delay before HaLow init
     vTaskDelay(pdMS_TO_TICKS(200));
     
-    // Initialize PSRAM buffers (after basic system is up)
+    // Initialize PSRAM buffers
     ESP_ERROR_CHECK(initialize_psram_buffers());
     
-    // Now initialize HaLow module (it will take over the SPI bus)
+    // Initialize HaLow module
     ESP_LOGI(TAG, "Initializing HaLow module...");
     app_wlan_init();
 }
@@ -1379,11 +1715,13 @@ static void print_statistics_task(void *arg)
         ESP_LOGI(TAG, "Total sent: %llu bytes", g_total_bytes_sent);
         ESP_LOGI(TAG, "Total SD written: %llu bytes", g_total_bytes_sd_written);
         ESP_LOGI(TAG, "SD buffered: %lu bytes", g_state.sd_bytes_buffered);
+        ESP_LOGI(TAG, "SD files pending: %d", g_state.sd_file_count - g_state.sd_current_file_index);
         ESP_LOGI(TAG, "Incoming buffer: %zu/%zu bytes", 
                  ring_buffer_get_data_size(g_incoming_buffer), PSRAM_INCOMING_BUFFER_SIZE);
-        ESP_LOGI(TAG, "Network: %s, Stream: %s", 
+        ESP_LOGI(TAG, "Network: %s, Stream: %s, Retries: %d/%d", 
                  g_state.network_healthy ? "OK" : "DOWN",
-                 g_state.stream_healthy ? "OK" : "DOWN");
+                 g_state.stream_healthy ? "OK" : "DOWN",
+                 g_state.stream_retry_count, STREAM_MAX_RETRIES);
         
         // Add PSRAM usage info
         size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
@@ -1403,50 +1741,33 @@ void app_main(void)
     // Print PSRAM information first
     print_psram_info();
     
-    // Initialize system components (SD first, then HaLow, following mandatory sequence)
+    // Initialize system components
     initialize_system();
     
-    // ===== Startup test sequence (verify SD/WiFi switching works) =====
+    // Startup test sequence
     ESP_LOGI(TAG, "=== Starting HaLow WiFi after SD initialization ===");
     
     // Start WiFi and connect to network
     if (wifi_reconnect() == ESP_OK) {
         ESP_LOGI(TAG, "WiFi connected successfully");
         
-        // Test SD card access while stopping WiFi
-        ESP_LOGI(TAG, "=== Testing SD card access (stopping WiFi temporarily) ===");
-        if (sd_card_mount() == ESP_OK) {
-            ESP_LOGI(TAG, "SD card mounted during test");
+        // Try to connect to streaming endpoint
+        if (stream_connect() == ESP_OK) {
+            g_state.stream_healthy = true;
             
-            // Write test file
-            FILE* f = fopen(MOUNT_POINT"/startup_test.txt", "w");
-            if (f != NULL) {
-                fprintf(f, "Startup test successful\n");
-                fclose(f);
-                ESP_LOGI(TAG, "Test file written to SD");
-            }
-            
-            sd_card_unmount();
-        }
-        
-        // Restart WiFi after SD test
-        vTaskDelay(pdMS_TO_TICKS(200));
-        ESP_LOGI(TAG, "=== Restarting WiFi after SD test ===");
-        
-        if (wifi_reconnect() == ESP_OK) {
-            ESP_LOGI(TAG, "WiFi reconnected after SD test");
-            
-            // Now try to connect to streaming endpoint
-            if (stream_connect() == ESP_OK) {
-                g_state.mode = MODE_STREAMING;
-                g_state.stream_healthy = true;
-                ESP_LOGI(TAG, "Stream connected, starting in STREAMING mode");
+            // Check if we have buffered files to upload
+            if (g_state.sd_file_count > 0) {
+                ESP_LOGI(TAG, "Found %d buffered files to upload, starting in CATCHING_UP mode", 
+                         g_state.sd_file_count);
+                g_state.mode = MODE_CATCHING_UP;
+                // Need to mount SD for reading
+                sd_card_mount();
             } else {
-                ESP_LOGW(TAG, "Stream connection failed, will start in SD mode");
-                switch_to_sd_mode();
+                g_state.mode = MODE_STREAMING;
+                ESP_LOGI(TAG, "No buffered files, starting in STREAMING mode");
             }
         } else {
-            ESP_LOGW(TAG, "WiFi reconnection failed, starting in SD mode");
+            ESP_LOGW(TAG, "Stream connection failed, will start in SD mode");
             switch_to_sd_mode();
         }
     } else {
@@ -1467,19 +1788,21 @@ void app_main(void)
     // Create tasks
     xTaskCreatePinnedToCore(daemon_task, "usb_daemon", 4096, NULL, 3, NULL, 0);
     xTaskCreatePinnedToCore(client_task, "usb_client", 8192, NULL, 4, NULL, 1);
-    xTaskCreatePinnedToCore(stream_manager_task, "stream_mgr", 8192, NULL, 5, 
-                           &stream_manager_task_handle, 1);
-    xTaskCreatePinnedToCore(network_monitor_task, "net_monitor", 4096, NULL, 4, 
-                           &network_monitor_task_handle, 1);
+    xTaskCreatePinnedToCore(stream_manager_task, "stream_mgr", 8192, NULL, 5, &stream_manager_task_handle, 1);
+    xTaskCreatePinnedToCore(network_monitor_task, "net_monitor", 4096, NULL, 4, &network_monitor_task_handle, 1);
     xTaskCreatePinnedToCore(print_statistics_task, "stats", 4096, NULL, 1, NULL, 0);
     
     ESP_LOGI(TAG, "=== System initialization complete ===");
     ESP_LOGI(TAG, "Audio data rate: %d kbps", AUDIO_DATA_RATE_BPS / 1000);
-    ESP_LOGI(TAG, "Buffer capacity: ~%d seconds", 
-             PSRAM_INCOMING_BUFFER_SIZE / (AUDIO_DATA_RATE_BPS / 8));
+    ESP_LOGI(TAG, "Buffer capacity: ~%d seconds", PSRAM_INCOMING_BUFFER_SIZE / (AUDIO_DATA_RATE_BPS / 8));
+    ESP_LOGI(TAG, "Stream retry delay: %d ms, max retries: %d", STREAM_RETRY_DELAY_MS, STREAM_MAX_RETRIES);
+    ESP_LOGI(TAG, "Network check interval: %d ms", NETWORK_CHECK_INTERVAL_MS);
     ESP_LOGI(TAG, "Current mode: %s", 
              g_state.mode == MODE_STREAMING ? "STREAMING" :
              g_state.mode == MODE_SD_BUFFERING ? "SD_BUFFERING" : "CATCHING_UP");
+    if (g_state.sd_file_count > 0) {
+        ESP_LOGI(TAG, "Buffered files to upload: %d", g_state.sd_file_count);
+    }
     
     // Final memory status
     size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
