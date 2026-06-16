@@ -1,0 +1,32 @@
+dependencies:
+  idf:
+    source:
+      type: idf
+    version: 5.4.3
+  morsemicro/firmware:
+    component_hash: ac3240c6e21705956abc03c9e45e022894aa10ee3dcef803c2f6ce77674f00cb
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 2.10.4-esp32-2
+  morsemicro/halow:
+    component_hash: fa1e12841657cb6abf1e656aaf071ae1326429e30b70c41deecad7de1667099b
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.4.2,<6.0'
+    - name: morsemicro/firmware
+      registry_url: https://components.espressif.com
+      require: private
+      version: ==2.10.4-esp32-2
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 2.10.4-esp32-2
+direct_dependencies:
+- morsemicro/firmware
+- morsemicro/halow
+manifest_hash: 1984eaf1155c3e97689fc75db5f407d9113c65c9f963b64ed8f420015cd4fb40
+target: esp32s3
+version: 2.0.0
