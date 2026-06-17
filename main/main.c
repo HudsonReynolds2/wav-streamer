@@ -1,5 +1,36 @@
 // AudioMoth USB -> HTTP chunked streamer with SD fallback and robust error handling
 // ESP-IDF v5.4.3 compatible
+//
+// ============================================================================
+//  HARDWARE CONSTRAINT: SD CARD AND HaLow RADIO SHARE ONE SPI BUS.
+//  THEY CAN NEVER BE ACTIVE AT THE SAME TIME.
+// ----------------------------------------------------------------------------
+//  The microSD card and the Morse HaLow module sit on the same SPI bus, so the
+//  bus must be owned by exactly one of them at any instant. sd_card_mount()
+//  suspends the radio (mmwlan_shutdown frees SPI2) before taking the bus, and
+//  halow_resume() re-inits the radio transport after the SD card releases it.
+//  Any TCP socket opened over the radio dies the moment the SD card is mounted.
+//
+//  This single fact dictates the whole catch-up design. We cannot read buffered
+//  audio from SD and stream it to the network simultaneously. Catch-up therefore
+//  runs as a strict ping-pong (see run_catchup_cycle):
+//
+//    Phase 1 (radio OFF, SD ON):  delete files confirmed sent last cycle, drain
+//                                 the live incoming ring to fresh SD files so no
+//                                 live audio is lost, then stage the oldest
+//                                 buffered file into the PSRAM stage buffer.
+//    Phase 2 (SD OFF, radio ON):  bring the radio up, open the stream, and push
+//                                 the staged buffer out. Files are deleted only
+//                                 AFTER their bytes are confirmed sent, so a
+//                                 crash re-sends (in-order duplicate) but never
+//                                 drops audio.
+//
+//  Ordering guarantee: SD filenames are a zero-padded monotonic counter
+//  (NVS-backed, survives reboots), and we always stage the oldest file first, so
+//  the server receives every byte exactly once, in chronological order, with no
+//  gaps. Reconnect splits the server-side WAV into separate clips, which is
+//  acceptable; no audio is lost across the seam.
+// ============================================================================
 
 #include <stdio.h>
 #include <string.h>
@@ -26,6 +57,7 @@
 
 #include "mmhalow.h"   // pulls in mmwlan.h, mmosal.h, esp_netif.h, esp_wifi.h
 #include "nvs_flash.h"
+#include "nvs.h"
 
 #include "usb/usb_host.h"
 #include "usb/usb_types_stack.h"
@@ -74,11 +106,45 @@
 #define WIFI_STATIC_NETMASK "255.255.255.0"     // /24, adjust if your subnet differs
 
 // Buffer configuration (easily changeable)
-#define PSRAM_INCOMING_BUFFER_SIZE  (3 * 1024 * 1024)  // 3MB for incoming USB data
-#define PSRAM_OUTGOING_BUFFER_SIZE  (3 * 1024 * 1024)  // 3MB for outgoing network data
-#define PSRAM_SWITCH_BUFFER_SIZE    (256 * 1024)       // 256KB for mode switching
-#define SD_BLOCK_SIZE               (32 * 1024)        // 32KB blocks for SD writes
+//
+// These sizes are chosen so catch-up actually converges. The cost of a catch-up cycle is
+// dominated by the radio bring-up (~3.5 s resume + connect) plus the SD phase (~4 s mount
+// + stage), which is fixed regardless of how much we send. If each radio phase sends only
+// one inflow-cycle's worth of audio, effective uplink barely exceeds the 96 KB/s USB inflow
+// and the backlog never drains. So we amortize that fixed cost over a larger batch: the
+// stage buffer holds ~3 MB (several SD files), and SD files are 1 MB each, so a cycle sends
+// up to 3 MB per radio bring-up (~31 s of audio) against the ~20 s the cycle takes to run,
+// a comfortable net drain.
+//
+// Incoming ring (3 MB, ~31 s at 96 KB/s) must survive the longest radio-only phase, during
+// which USB keeps filling it. Radio phases run ~15-20 s and the ring is drained to SD at the
+// start of every cycle, so it begins each cycle near empty; 3 MB leaves clear margin while
+// freeing PSRAM for the larger stage buffer.
+#define PSRAM_INCOMING_BUFFER_SIZE  (3 * 1024 * 1024)  // 3MB incoming USB ring (~31s)
+#define PSRAM_STAGE_BUFFER_SIZE     (3 * 1024 * 1024)  // 3MB catch-up stage (several files)
+#define SD_BLOCK_SIZE               (32 * 1024)        // 32KB blocks for SD writes / frames
 #define SD_MAX_WRITE_SIZE           (128 * 1024)       // Max 128KB per SD write operation
+
+// Each buffered SD file is exactly this many bytes (except a short final file at the tail
+// of a buffering burst). 1 MB keeps files small enough that several stage together into the
+// 3 MB stage buffer, amortizing the per-cycle radio bring-up over more data. Must be a
+// multiple of SD_BLOCK_SIZE (1MB / 32KB = 32) and of the 512-byte sector size.
+#define SD_FILE_SIZE                (1 * 1024 * 1024)
+
+// During a catch-up radio phase the incoming ring is not being drained. If it
+// climbs past this fraction of capacity we abort the upload early and go back to
+// the SD phase to drain it, so live audio is never lost to overflow.
+#define CATCHUP_INCOMING_ABORT_NUM  85
+#define CATCHUP_INCOMING_ABORT_DEN  100
+
+// NVS-backed monotonic file counter. We reserve a block of IDs at a time and hand
+// them out from RAM, so NVS sees one write per block (negligible flash wear) and a
+// crash wastes at most (BLOCK-1) IDs without ever reusing one. This keeps filenames
+// strictly increasing across reboots, which is what makes oldest-first replay sort
+// correctly when there is no real-time clock.
+#define NVS_COUNTER_NAMESPACE       "wavstream"
+#define NVS_COUNTER_KEY             "filectr"
+#define NVS_COUNTER_BLOCK           256
 
 // Timing configuration (easily changeable)
 #define STREAM_RETRY_DELAY_MS       5000   // Delay between stream reconnection attempts
@@ -97,6 +163,13 @@
 #define NUM_ISO_URBS         3
 
 #define FRAME_HEADER_SIZE    6   // 3 bytes seq + 3 bytes length
+
+// The server reserves sequence value 0xFFFFFF as a metadata marker and drops any
+// frame carrying it. The 24-bit stream sequence must therefore skip 0xFFFFFF on
+// wrap (see seq_advance) so we never silently lose a 32KB block once every ~64
+// days of continuous streaming.
+#define STREAM_SEQ_METADATA  0xFFFFFF
+#define STREAM_SEQ_MASK      0xFFFFFF
 
 static const char *TAG = "am_robust_stream";
 
@@ -135,16 +208,17 @@ typedef struct {
     int64_t last_stream_write_ms;
     int64_t last_catchup_pause_ms;
     uint32_t sequence_number;
-    uint32_t sd_bytes_buffered;
-    
+    uint64_t sd_bytes_to_catch_up;  // bytes on the card not yet confirmed delivered; 64-bit
+                                    // since a multi-day outage at 96 KB/s overflows 32-bit
+
     // SD file management
     char current_write_filename[128];
     char current_read_filename[128];
     FILE *sd_write_file;
     FILE *sd_read_file;
+    size_t sd_write_file_bytes;     // bytes in the currently open write file (drives rotation)
     sd_file_info_t *sd_file_list;
     int sd_file_count;
-    int sd_current_file_index;
     
     SemaphoreHandle_t state_mutex;
 } system_state_t;
@@ -165,8 +239,27 @@ typedef struct {
 
 // Ring buffers in PSRAM
 static ring_buffer_t *g_incoming_buffer = NULL;
-static ring_buffer_t *g_outgoing_buffer = NULL;
-static uint8_t *g_switch_buffer = NULL;
+// Flat catch-up stage buffer (formerly the unused "outgoing" ring). Holds one whole
+// SD file read off the card during the radio-off phase, then streamed out radio-on.
+static uint8_t *g_stage_buffer = NULL;
+
+// Catch-up staging state. g_staged_files holds the SD files currently sitting in
+// g_stage_buffer; once their bytes are confirmed sent (g_staged_uploaded), the next
+// SD phase deletes them. A whole file fits the stage 1:1, but smaller tail files may
+// let several fit, so this is a small list.
+#define CATCHUP_MAX_STAGED_FILES 8
+static char   g_staged_files[CATCHUP_MAX_STAGED_FILES][128];
+static int    g_staged_count = 0;
+static size_t g_staged_bytes = 0;
+static bool   g_staged_uploaded = false;
+// Bytes of the current staged batch already confirmed sent. If a radio phase aborts early
+// for ring pressure, this preserves how far we got: the next cycle drains the ring and
+// re-stages (drained files always get higher counter IDs, so they sort newer and the staged
+// prefix is reproduced byte-for-byte), then the radio phase resumes sending from this offset
+// without re-sending or re-advancing the sequence. The server reassembles by frame sequence
+// number, so a single byte offset is all that must survive an abort; file boundaries are
+// irrelevant on the wire. Reset to 0 whenever a batch fully completes.
+static size_t g_staged_sent_off = 0;
 
 // System state
 static system_state_t g_state = {
@@ -177,12 +270,11 @@ static system_state_t g_state = {
     .wifi_connected = false,
     .stream_retry_count = 0,
     .sequence_number = 0,
-    .sd_bytes_buffered = 0,
+    .sd_bytes_to_catch_up = 0,
     .sd_write_file = NULL,
     .sd_read_file = NULL,
     .sd_file_list = NULL,
-    .sd_file_count = 0,
-    .sd_current_file_index = 0
+    .sd_file_count = 0
 };
 
 // Streaming context
@@ -217,6 +309,26 @@ static TaskHandle_t network_monitor_task_handle = NULL;
 static uint64_t g_total_bytes_received = 0;
 static uint64_t g_total_bytes_sent = 0;
 static uint64_t g_total_bytes_sd_written = 0;
+
+// NVS-backed monotonic file counter (see NVS_COUNTER_* defines). g_file_ctr_next is
+// the next ID to hand out; g_file_ctr_block_end is the first ID we have NOT yet
+// reserved from NVS. g_max_existing_ctr is the highest ID found on the card at boot,
+// used to bump the counter forward if NVS was ever erased while files remained.
+static nvs_handle_t g_ctr_nvs = 0;
+static uint32_t     g_file_ctr_next = 0;
+static uint32_t     g_file_ctr_block_end = 0;
+static uint32_t     g_max_existing_ctr = 0;
+static SemaphoreHandle_t g_file_ctr_mutex = NULL;
+
+// Forward declarations
+static esp_err_t sd_close_write_file(void);
+static void run_catchup_cycle(uint8_t *work_buffer);
+// run_catchup_cycle (in the SD section) drives the mode transitions and radio bring-up,
+// which are defined later in the Mode Management / Network sections.
+static esp_err_t switch_to_streaming_mode(void);
+static esp_err_t switch_to_sd_mode(void);
+static esp_err_t switch_to_catchup_mode(void);
+static esp_err_t wifi_reconnect(void);
 
 /* ========================== Ring Buffer Functions ========================== */
 
@@ -305,7 +417,12 @@ static size_t ring_buffer_write(ring_buffer_t *rb, const uint8_t *data, size_t l
     return to_write;
 }
 
-static size_t ring_buffer_read(ring_buffer_t *rb, uint8_t *data, size_t len)
+// Copy up to len bytes from the read position WITHOUT advancing it. Pairs with
+// ring_buffer_consume: peek a block, try to send/write it, and only consume it on
+// success. On failure the bytes stay at the head of the ring in their original order,
+// so a retry re-sends exactly the same block. This replaces the old read-then-write-back
+// pattern, which pushed a failed block back behind newer USB audio and scrambled order.
+static size_t ring_buffer_peek(ring_buffer_t *rb, uint8_t *data, size_t len)
 {
     if (!rb || !data || len == 0) return 0;
     
@@ -318,7 +435,7 @@ static size_t ring_buffer_read(ring_buffer_t *rb, uint8_t *data, size_t len)
         return 0;
     }
     
-    // Read in up to two chunks (wrap around)
+    // Read in up to two chunks (wrap around), leaving read_pos/data_size untouched
     size_t first_chunk = rb->capacity - rb->read_pos;
     if (first_chunk > to_read) first_chunk = to_read;
     
@@ -328,11 +445,25 @@ static size_t ring_buffer_read(ring_buffer_t *rb, uint8_t *data, size_t len)
         memcpy(data + first_chunk, rb->buffer, to_read - first_chunk);
     }
     
-    rb->read_pos = (rb->read_pos + to_read) % rb->capacity;
-    rb->data_size -= to_read;
-    
     xSemaphoreGive(rb->mutex);
     return to_read;
+}
+
+// Advance the read pointer by len bytes, discarding them. Call only after the bytes
+// returned by a preceding ring_buffer_peek have been successfully sent or written.
+// Returns the number actually consumed (clamped to data_size for safety).
+static size_t ring_buffer_consume(ring_buffer_t *rb, size_t len)
+{
+    if (!rb || len == 0) return 0;
+    
+    xSemaphoreTake(rb->mutex, portMAX_DELAY);
+    
+    size_t to_consume = (len > rb->data_size) ? rb->data_size : len;
+    rb->read_pos = (rb->read_pos + to_consume) % rb->capacity;
+    rb->data_size -= to_consume;
+    
+    xSemaphoreGive(rb->mutex);
+    return to_consume;
 }
 
 static size_t ring_buffer_get_data_size(ring_buffer_t *rb)
@@ -368,6 +499,21 @@ static int write_chunked_data(esp_http_client_handle_t client, const uint8_t *da
 static int write_chunked_end(esp_http_client_handle_t client)
 {
     return (esp_http_client_write(client, "0\r\n\r\n", 5) == 5) ? 0 : -1;
+}
+
+// Advance the 24-bit stream sequence, skipping STREAM_SEQ_METADATA (0xFFFFFF). The
+// server reserves 0xFFFFFF as a metadata marker and drops any data frame carrying it,
+// so a plain "& 0xFFFFFF" wrap would silently lose one 32KB block roughly every 64 days
+// of continuous streaming and then split the file at the following zero. Skipping it
+// lands the sequence on 0 at wrap, which is exactly what the server's expected_seq remap
+// anticipates: a clean file split, no lost block.
+static inline uint32_t seq_advance(uint32_t seq)
+{
+    seq = (seq + 1) & STREAM_SEQ_MASK;
+    if (seq == STREAM_SEQ_METADATA) {
+        seq = 0;
+    }
+    return seq;
 }
 
 static esp_err_t stream_connect(void)
@@ -536,6 +682,118 @@ static int compare_files_by_timestamp(const void *a, const void *b)
     return 0;
 }
 
+// Buffered files are named XXXXXXXX.bin: exactly eight hex digits from the uint32
+// counter plus the .bin extension, which is exactly 8.3 (no long-filename support on
+// this FATFS build). Zero-padding makes lexical order equal numeric order, so the
+// directory scan can sort chronologically without a real-time clock. is_backlog_name
+// validates that an 8.3 entry is one of ours (8 hex chars + .bin), so stray files like
+// the startup test.txt are ignored. parse_backlog_id reads the counter back out.
+static bool is_backlog_name(const char *name, uint32_t *id_out)
+{
+    // Expect exactly "XXXXXXXX.bin": 8 hex digits, a dot, then bin.
+    if (strlen(name) != 12) return false;
+    if (name[8] != '.' ||
+        (name[9] != 'b' && name[9] != 'B') ||
+        (name[10] != 'i' && name[10] != 'I') ||
+        (name[11] != 'n' && name[11] != 'N')) {
+        return false;
+    }
+    uint32_t id = 0;
+    for (int i = 0; i < 8; i++) {
+        char ch = name[i];
+        uint32_t nyb;
+        if      (ch >= '0' && ch <= '9') nyb = (uint32_t)(ch - '0');
+        else if (ch >= 'a' && ch <= 'f') nyb = (uint32_t)(ch - 'a' + 10);
+        else if (ch >= 'A' && ch <= 'F') nyb = (uint32_t)(ch - 'A' + 10);
+        else return false;
+        id = (id << 4) | nyb;
+    }
+    if (id_out) *id_out = id;
+    return true;
+}
+
+// NVS-backed monotonic counter with block reservation. On boot we read the stored
+// high-water mark and immediately reserve a block of NVS_COUNTER_BLOCK IDs by writing
+// (highwater + BLOCK) back once, then hand out IDs from RAM until the block is exhausted
+// and reserve again. NVS therefore sees one write per block (negligible flash wear), and
+// a crash wastes at most (BLOCK-1) unused IDs but never reuses one, so files always sort
+// after older pending files. g_max_existing_ctr (the highest ID found on the card at
+// boot) bumps the start forward if NVS was ever erased while files remained.
+static esp_err_t file_counter_init(void)
+{
+    g_file_ctr_mutex = xSemaphoreCreateMutex();
+    if (!g_file_ctr_mutex) {
+        ESP_LOGE(TAG, "Failed to create file counter mutex");
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t err = nvs_open(NVS_COUNTER_NAMESPACE, NVS_READWRITE, &g_ctr_nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open(%s) failed: %s", NVS_COUNTER_NAMESPACE, esp_err_to_name(err));
+        return err;
+    }
+
+    uint32_t highwater = 0;
+    err = nvs_get_u32(g_ctr_nvs, NVS_COUNTER_KEY, &highwater);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        highwater = 0;          // first ever boot
+    } else if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_get_u32 failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // If files already on the card number at or above the stored high-water (e.g. NVS was
+    // erased), start above them so new files still sort last.
+    if (g_max_existing_ctr + 1 > highwater) {
+        highwater = g_max_existing_ctr + 1;
+    }
+
+    // Reserve a block: persist highwater + BLOCK now, hand out [highwater, highwater+BLOCK).
+    uint32_t new_highwater = highwater + NVS_COUNTER_BLOCK;
+    err = nvs_set_u32(g_ctr_nvs, NVS_COUNTER_KEY, new_highwater);
+    if (err == ESP_OK) err = nvs_commit(g_ctr_nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Reserving counter block failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    g_file_ctr_next = highwater;
+    g_file_ctr_block_end = new_highwater;
+    ESP_LOGI(TAG, "File counter initialized: next=%08" PRIx32 ", block_end=%08" PRIx32,
+             g_file_ctr_next, g_file_ctr_block_end);
+    return ESP_OK;
+}
+
+// Hand out the next monotonic file ID, reserving a fresh NVS block when the current one
+// is exhausted. Safe to call from any task (guarded by g_file_ctr_mutex).
+static esp_err_t file_counter_next(uint32_t *id_out)
+{
+    if (!g_file_ctr_mutex || !id_out) return ESP_FAIL;
+    xSemaphoreTake(g_file_ctr_mutex, portMAX_DELAY);
+
+    if (g_file_ctr_next >= g_file_ctr_block_end) {
+        uint32_t new_highwater = g_file_ctr_block_end + NVS_COUNTER_BLOCK;
+        esp_err_t err = nvs_set_u32(g_ctr_nvs, NVS_COUNTER_KEY, new_highwater);
+        if (err == ESP_OK) err = nvs_commit(g_ctr_nvs);
+        if (err != ESP_OK) {
+            xSemaphoreGive(g_file_ctr_mutex);
+            ESP_LOGE(TAG, "Reserving next counter block failed: %s", esp_err_to_name(err));
+            return err;
+        }
+        g_file_ctr_block_end = new_highwater;
+    }
+
+    *id_out = g_file_ctr_next++;
+    xSemaphoreGive(g_file_ctr_mutex);
+    return ESP_OK;
+}
+
+// Build the full path "/sdcard/XXXXXXXX.bin" for a counter ID.
+static void backlog_path_from_id(uint32_t id, char *out, size_t out_sz)
+{
+    snprintf(out, out_sz, MOUNT_POINT "/%08" PRIx32 ".bin", id);
+}
+
 // Scan SD card for buffered files
 static esp_err_t sd_scan_buffered_files(void)
 {
@@ -556,7 +814,6 @@ static esp_err_t sd_scan_buffered_files(void)
         g_state.sd_file_list = NULL;
     }
     g_state.sd_file_count = 0;
-    g_state.sd_current_file_index = 0;
     
     dir = opendir(MOUNT_POINT);
     if (dir == NULL) {
@@ -564,11 +821,14 @@ static esp_err_t sd_scan_buffered_files(void)
         return ESP_FAIL;
     }
     
-    // Count audio buffer files
+    // Count backlog files (XXXXXXXX.bin) and track the highest ID seen, which seeds the
+    // NVS counter on first boot / after an NVS erase so new files still sort last.
     int file_count = 0;
+    uint32_t id;
     while ((entry = readdir(dir)) != NULL) {
-        if (strstr(entry->d_name, "aux_") != NULL && strstr(entry->d_name, ".bin") != NULL) {
+        if (is_backlog_name(entry->d_name, &id)) {
             file_count++;
+            if (id > g_max_existing_ctr) g_max_existing_ctr = id;
         }
     }
     
@@ -592,13 +852,7 @@ static esp_err_t sd_scan_buffered_files(void)
     rewinddir(dir);
     int index = 0;
     while ((entry = readdir(dir)) != NULL && index < file_count) {
-        if (strstr(entry->d_name, "aux_") != NULL && strstr(entry->d_name, ".bin") != NULL) {
-            // Check if the filename is too long
-            if (strlen(entry->d_name) > 400) {  // Leave room for mount point and slash
-                ESP_LOGW(TAG, "Filename too long, skipping: %.50s...", entry->d_name);
-                continue;
-            }
-            
+        if (is_backlog_name(entry->d_name, &id)) {
             int ret = snprintf(full_path, sizeof(full_path), "%s/%s", MOUNT_POINT, entry->d_name);
             if (ret >= sizeof(full_path)) {
                 ESP_LOGW(TAG, "Path truncated, skipping file: %s", entry->d_name);
@@ -609,9 +863,8 @@ static esp_err_t sd_scan_buffered_files(void)
                 strncpy(g_state.sd_file_list[index].filename, full_path, sizeof(g_state.sd_file_list[index].filename) - 1);
                 g_state.sd_file_list[index].filename[sizeof(g_state.sd_file_list[index].filename) - 1] = '\0';  // Ensure null termination
                 
-                // Extract timestamp from filename (aux_TIMESTAMP.bin)
-                char *timestamp_str = strstr(entry->d_name, "aux_") + strlen("aux_");
-                g_state.sd_file_list[index].timestamp = atoll(timestamp_str);
+                // The 8-hex-digit base is the monotonic counter; it sorts chronologically.
+                g_state.sd_file_list[index].timestamp = (int64_t)id;
                 
                 index++;
             }
@@ -650,6 +903,11 @@ static esp_err_t sd_card_mount(void)
     // + spi_bus_free(SPI2_HOST), fully releasing the bus. The netif and rx/link callbacks
     // registered in mmhalow_init() survive this and are reused on resume.
     ESP_LOGI(TAG, "Suspending HaLow for SD access...");
+    // Tear down any open HTTP stream first. Suspending the radio (mmwlan_shutdown) kills the
+    // underlying socket, so leaving stream_ctx.client open would orphan it: the next
+    // stream_connect() would see a stale client ("already exists") and the server would log a
+    // connection abort. Closing it here keeps each radio phase's connect clean.
+    stream_disconnect();
     if (g_halow_initialized) {
         mmwlan_sta_disable();   // disconnect STA
         mmwlan_shutdown();      // power down radio + free SPI2 (via shim mmhal_wlan_deinit)
@@ -726,41 +984,43 @@ static esp_err_t sd_card_unmount(void)
     return ret;
 }
 
+// Close the current write file (if any) and clear the per-file byte counter. Defined
+// here (forward-declared at top) so both the buffering path and catch-up can rotate or
+// finalize the open file through one place. Returns ESP_OK even if no file was open.
+static esp_err_t sd_close_write_file(void)
+{
+    if (g_state.sd_write_file) {
+        fclose(g_state.sd_write_file);
+        g_state.sd_write_file = NULL;
+    }
+    g_state.sd_write_file_bytes = 0;
+    return ESP_OK;
+}
+
 static esp_err_t sd_write_audio_data(const uint8_t *data, size_t len)
 {
     if (!g_state.sd_mounted || !data || len == 0) {
         return ESP_FAIL;
     }
     
-    // Open file if not already open
+    // Open a new counter-named file if none is open. Files are XXXXXXXX.bin (8.3, eight
+    // hex digits from the monotonic NVS counter), so they sort chronologically and a
+    // whole file fits the stage buffer 1:1.
     if (!g_state.sd_write_file) {
-        // Generate filename with timestamp
-        int64_t timestamp = esp_timer_get_time() / 1000000; // Convert to seconds
-        snprintf(g_state.current_write_filename, sizeof(g_state.current_write_filename),
-                 MOUNT_POINT"/aux_%lld.bin", timestamp);
-        
-        // Make sure to close any stale file handle first
-        if (g_state.sd_write_file) {
-            fclose(g_state.sd_write_file);
-            g_state.sd_write_file = NULL;
+        uint32_t id;
+        if (file_counter_next(&id) != ESP_OK) {
+            ESP_LOGE(TAG, "Could not obtain next file counter");
+            return ESP_FAIL;
         }
+        backlog_path_from_id(id, g_state.current_write_filename, sizeof(g_state.current_write_filename));
         
         g_state.sd_write_file = fopen(g_state.current_write_filename, "wb");
         if (!g_state.sd_write_file) {
             ESP_LOGE(TAG, "Failed to open SD file for writing: %s", g_state.current_write_filename);
             ESP_LOGE(TAG, "errno: %d (%s)", errno, strerror(errno));
-            
-            // Try with a simpler filename
-            static int file_counter = 0;
-            snprintf(g_state.current_write_filename, sizeof(g_state.current_write_filename),
-                     MOUNT_POINT"/aux_%d.bin", file_counter++);
-            
-            g_state.sd_write_file = fopen(g_state.current_write_filename, "wb");
-            if (!g_state.sd_write_file) {
-                ESP_LOGE(TAG, "Failed to open simplified SD file: %s", g_state.current_write_filename);
-                return ESP_FAIL;
-            }
+            return ESP_FAIL;
         }
+        g_state.sd_write_file_bytes = 0;
         ESP_LOGI(TAG, "Opened SD file for writing: %s", g_state.current_write_filename);
     }
     
@@ -773,8 +1033,7 @@ static esp_err_t sd_write_audio_data(const uint8_t *data, size_t len)
             ESP_LOGE(TAG, "SD write failed: wrote %zu of %zu bytes, errno: %d (%s)", 
                      result, chunk_size, errno, strerror(errno));
             // Close the failed file
-            fclose(g_state.sd_write_file);
-            g_state.sd_write_file = NULL;
+            sd_close_write_file();
             return ESP_FAIL;
         }
         written += result;
@@ -784,105 +1043,287 @@ static esp_err_t sd_write_audio_data(const uint8_t *data, size_t len)
     if (fflush(g_state.sd_write_file) != 0) {
         ESP_LOGE(TAG, "SD flush failed: errno: %d (%s)", errno, strerror(errno));
         // Close the failed file
-        fclose(g_state.sd_write_file);
-        g_state.sd_write_file = NULL;
+        sd_close_write_file();
         return ESP_FAIL;
     }
     
-    g_state.sd_bytes_buffered += written;
+    g_state.sd_bytes_to_catch_up += written;
     g_total_bytes_sd_written += written;
+    g_state.sd_write_file_bytes += written;
     
-    // Periodically close and reopen file to prevent issues
-    static size_t bytes_in_current_file = 0;
-    bytes_in_current_file += written;
-    if (bytes_in_current_file > (10 * 1024 * 1024)) { // 10MB per file
-        ESP_LOGI(TAG, "Rotating SD file after 10MB");
-        fclose(g_state.sd_write_file);
-        g_state.sd_write_file = NULL;
-        bytes_in_current_file = 0;
+    // Rotate at SD_FILE_SIZE so each file fits the catch-up stage buffer 1:1. Callers
+    // feed SD_BLOCK_SIZE-aligned blocks and SD_FILE_SIZE is a multiple of SD_BLOCK_SIZE,
+    // so files land exactly on the cap (a short final file only occurs when buffering
+    // stops mid-file, which the stage buffer still accommodates).
+    if (g_state.sd_write_file_bytes >= SD_FILE_SIZE) {
+        ESP_LOGI(TAG, "Rotating SD file at %d KB: %s",
+                 SD_FILE_SIZE / 1024, g_state.current_write_filename);
+        sd_close_write_file();
     }
     
     return ESP_OK;
 }
 
-static esp_err_t sd_open_next_file_for_reading(void)
+// Delete the files staged-and-confirmed in the previous radio phase. Called at the start
+// of an SD phase (bus owned by SD). Clears the staging record afterward. This is the
+// deferred half of delete-on-confirmed-send: a file's bytes are known to have reached the
+// server before we remove it, so a crash mid-cycle re-sends an in-order duplicate but
+// never drops audio.
+static void catchup_delete_confirmed(void)
 {
-    // Close current read file if open
-    if (g_state.sd_read_file) {
-        fclose(g_state.sd_read_file);
-        g_state.sd_read_file = NULL;
-        
-        // Delete the file we just finished reading
-        if (strlen(g_state.current_read_filename) > 0) {
-            ESP_LOGI(TAG, "Deleting uploaded file: %s", g_state.current_read_filename);
-            unlink(g_state.current_read_filename);
+    if (!g_staged_uploaded || g_staged_count == 0) {
+        return;
+    }
+    for (int i = 0; i < g_staged_count; i++) {
+        // Subtract the file's bytes from the catch-up total before removing it, so the stat
+        // reflects only data still awaiting confirmed delivery.
+        struct stat st;
+        if (stat(g_staged_files[i], &st) == 0) {
+            uint64_t fb = (uint64_t)st.st_size;
+            g_state.sd_bytes_to_catch_up = (g_state.sd_bytes_to_catch_up >= fb)
+                                         ? (g_state.sd_bytes_to_catch_up - fb) : 0;
+        }
+        ESP_LOGI(TAG, "Deleting confirmed-sent file: %s", g_staged_files[i]);
+        unlink(g_staged_files[i]);
+    }
+    g_staged_count = 0;
+    g_staged_bytes = 0;
+    g_staged_uploaded = false;
+}
+
+// SD phase of a catch-up cycle (radio OFF, SD ON). Returns the sd_file_list index of the
+// last file FULLY staged this cycle, or -1 if nothing was staged (backlog empty; caller
+// then hands off to live streaming). The bus must be owned by SD on entry (caller mounts).
+//   1. delete files confirmed sent last cycle
+//   2. drain the live incoming ring to fresh counter-named SD files (preserve live audio
+//      captured during the previous radio phase, in order)
+//   3. rescan oldest-first
+//   4. stage whole oldest files into g_stage_buffer up to its cap
+// Returning the last fully-staged index (rather than a count) lets the caller detect "we
+// staged through the final backlog file" robustly even if an earlier file was skipped.
+static int catchup_sd_phase(uint8_t *work_buffer)
+{
+    // 1. Delete last cycle's confirmed files.
+    catchup_delete_confirmed();
+
+    // 2. Drain the incoming ring to SD so nothing captured during the last radio phase is
+    //    lost. Whole blocks first; a final short block flushes the remainder.
+    size_t avail = ring_buffer_get_data_size(g_incoming_buffer);
+    while (avail >= SD_BLOCK_SIZE) {
+        size_t got = ring_buffer_peek(g_incoming_buffer, work_buffer, SD_BLOCK_SIZE);
+        if (got == 0) break;
+        if (sd_write_audio_data(work_buffer, got) != ESP_OK) {
+            ESP_LOGE(TAG, "SD write failed draining ring during catch-up");
+            break;
+        }
+        ring_buffer_consume(g_incoming_buffer, got);
+        avail = ring_buffer_get_data_size(g_incoming_buffer);
+    }
+    if (avail > 0) {
+        size_t got = ring_buffer_peek(g_incoming_buffer, work_buffer, avail);
+        if (got > 0 && sd_write_audio_data(work_buffer, got) == ESP_OK) {
+            ring_buffer_consume(g_incoming_buffer, got);
         }
     }
-    
-    // Check if we have more files to read
-    if (g_state.sd_current_file_index >= g_state.sd_file_count) {
-        ESP_LOGI(TAG, "All buffered files have been uploaded");
-        // Reset file list
-        if (g_state.sd_file_list) {
-            free(g_state.sd_file_list);
-            g_state.sd_file_list = NULL;
+    // Close the write file so the drained data is a complete, scannable backlog file.
+    sd_close_write_file();
+
+    // 3. Rescan oldest-first (includes whatever we just drained).
+    sd_scan_buffered_files();
+    if (g_state.sd_file_count == 0) {
+        return -1;   // nothing to catch up
+    }
+
+    // 4. Stage whole oldest files into the flat stage buffer, up to its cap. A whole file
+    //    fits 1:1, but short tail files may let several fit; remember each so we can delete
+    //    them once their bytes are confirmed sent.
+    g_staged_count = 0;
+    g_staged_bytes = 0;
+    g_staged_uploaded = false;
+    int last_full_idx = -1;
+
+    for (int idx = 0; idx < g_state.sd_file_count && g_staged_count < CATCHUP_MAX_STAGED_FILES; idx++) {
+        const char *path = g_state.sd_file_list[idx].filename;
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            ESP_LOGW(TAG, "Cannot stat staged candidate %s, skipping", path);
+            continue;
         }
-        g_state.sd_file_count = 0;
-        g_state.sd_current_file_index = 0;
-        g_state.sd_bytes_buffered = 0;
-        return ESP_OK;  // No more files
+        size_t fsize = (size_t)st.st_size;
+        // Stop if this file would not fit alongside what is already staged. Always stage at
+        // least one file even if (pathologically) it exceeds the cap, reading only what fits.
+        if (g_staged_bytes > 0 && (g_staged_bytes + fsize) > PSRAM_STAGE_BUFFER_SIZE) {
+            break;
+        }
+        size_t room = PSRAM_STAGE_BUFFER_SIZE - g_staged_bytes;
+        size_t to_read = (fsize > room) ? room : fsize;
+
+        FILE *f = fopen(path, "rb");
+        if (!f) {
+            ESP_LOGE(TAG, "Failed to open %s for staging", path);
+            continue;
+        }
+        size_t rd = fread(g_stage_buffer + g_staged_bytes, 1, to_read, f);
+        fclose(f);
+        if (rd == 0) {
+            continue;
+        }
+        g_staged_bytes += rd;
+        strncpy(g_staged_files[g_staged_count], path, sizeof(g_staged_files[0]) - 1);
+        g_staged_files[g_staged_count][sizeof(g_staged_files[0]) - 1] = '\0';
+        g_staged_count++;
+
+        // Only a fully-read file counts toward "staged through this index". A truncated
+        // read (file larger than remaining room) means there is more of it still to send,
+        // so it must not be treated as completing the backlog.
+        if (rd == fsize) {
+            last_full_idx = idx;
+        }
+
+        if (g_staged_bytes >= PSRAM_STAGE_BUFFER_SIZE) {
+            break;   // stage full
+        }
     }
-    
-    // Open next file
-    strncpy(g_state.current_read_filename, g_state.sd_file_list[g_state.sd_current_file_index].filename, 
-            sizeof(g_state.current_read_filename) - 1);
-    
-    g_state.sd_read_file = fopen(g_state.current_read_filename, "rb");
-    if (!g_state.sd_read_file) {
-        ESP_LOGE(TAG, "Failed to open SD file for reading: %s", g_state.current_read_filename);
-        g_state.sd_current_file_index++;
-        return ESP_FAIL;
+
+    ESP_LOGI(TAG, "Staged %d file(s), %zu bytes for upload", g_staged_count, g_staged_bytes);
+    return (g_staged_bytes > 0) ? last_full_idx : -1;
+}
+
+// Radio phase of a catch-up cycle (SD OFF, radio ON). The staged buffer is pushed out as
+// SD_BLOCK_SIZE frames, resuming from g_staged_sent_off (nonzero only after a prior abort).
+// The bus is owned by the radio (caller brings it up), so the incoming USB ring is NOT being
+// drained during this phase; it fills at 96 KB/s. Between frames we watch the ring and, if it
+// climbs past CATCHUP_INCOMING_ABORT_NUM/DEN of capacity, abort and return ESP_ERR_TIMEOUT so
+// the caller flips back to an SD phase to drain it before isoc_in_cb drops live audio. The
+// confirmed offset is saved so the next cycle resumes rather than re-sending. Returns:
+//   ESP_OK          - whole staged buffer confirmed sent (marked for deletion)
+//   ESP_ERR_TIMEOUT - aborted early for ring pressure; progress saved, stay in catch-up
+//   ESP_FAIL        - send error; staged files intact, fall back to SD buffering
+static esp_err_t catchup_radio_phase(void)
+{
+    const size_t abort_threshold =
+        (size_t)((uint64_t)PSRAM_INCOMING_BUFFER_SIZE * CATCHUP_INCOMING_ABORT_NUM
+                 / CATCHUP_INCOMING_ABORT_DEN);
+
+    // Resume from wherever a prior abort left off. The re-staged prefix is identical (drained
+    // files sort newer), so this offset still points at the next unsent byte.
+    size_t off = (g_staged_sent_off < g_staged_bytes) ? g_staged_sent_off : 0;
+
+    while (off < g_staged_bytes) {
+        // If the incoming ring is filling while we hold the bus, stop sending and let the
+        // caller drain it to SD. Bytes already sent stay confirmed (saved in g_staged_sent_off
+        // and not re-sent), so nothing is lost or duplicated on the wire; the sequence number
+        // is not rewound.
+        if (ring_buffer_get_data_size(g_incoming_buffer) >= abort_threshold) {
+            ESP_LOGW(TAG, "Incoming ring above %d%%, aborting catch-up send at %zu/%zu to drain",
+                     (CATCHUP_INCOMING_ABORT_NUM * 100) / CATCHUP_INCOMING_ABORT_DEN,
+                     off, g_staged_bytes);
+            g_staged_sent_off = off;
+            return ESP_ERR_TIMEOUT;
+        }
+
+        size_t chunk = g_staged_bytes - off;
+        if (chunk > SD_BLOCK_SIZE) chunk = SD_BLOCK_SIZE;
+
+        esp_err_t err = stream_send_with_header(g_stage_buffer + off, chunk, g_state.sequence_number);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Catch-up send failed at offset %zu/%zu", off, g_staged_bytes);
+            g_staged_sent_off = off;   // preserve progress; SD-buffering fallback re-stages
+            return ESP_FAIL;
+        }
+        g_state.sequence_number = seq_advance(g_state.sequence_number);
+        g_state.last_stream_write_ms = esp_timer_get_time() / 1000;
+        g_total_bytes_sent += chunk;
+        off += chunk;
     }
-    
-    ESP_LOGI(TAG, "Opened file [%d/%d] for reading: %s", 
-             g_state.sd_current_file_index + 1, g_state.sd_file_count, g_state.current_read_filename);
-    
-    g_state.sd_current_file_index++;
+
+    // Whole staged buffer confirmed sent: mark for deletion at the next SD phase, reset the
+    // resume offset for the next batch.
+    g_staged_uploaded = true;
+    g_staged_sent_off = 0;
     return ESP_OK;
 }
 
-static esp_err_t sd_read_audio_data(uint8_t *data, size_t len, size_t *bytes_read)
+// One full catch-up cycle, a strict SD<->radio ping-pong (SD and radio share one SPI bus
+// and can never be active together). Owns the bus end to end and chooses the next mode:
+//   - send phase fails           -> fall back to SD buffering (audio preserved on card)
+//   - backlog fully drained      -> hand off to live streaming
+//   - more backlog remains       -> stay in CATCHING_UP for another cycle
+// state_mutex is held only around the short state mutations, not across the long blocking
+// mount / radio-resume / network I/O, matching the locking granularity used elsewhere.
+static void run_catchup_cycle(uint8_t *work_buffer)
 {
-    if (!g_state.sd_mounted || !data) {
-        return ESP_FAIL;
+    // ---- SD phase: bus to SD, stage the oldest backlog ----
+    if (sd_card_mount() != ESP_OK) {
+        ESP_LOGE(TAG, "Catch-up: SD mount failed, falling back to SD buffering");
+        switch_to_sd_mode();
+        return;
     }
-    
-    *bytes_read = 0;
-    
-    // If no read file is open, try to open the next one
-    if (!g_state.sd_read_file) {
-        if (sd_open_next_file_for_reading() != ESP_OK) {
-            return ESP_OK;  // No more files, but not an error
+
+    int last_staged_idx = catchup_sd_phase(work_buffer);
+
+    if (last_staged_idx < 0) {
+        // Backlog drained. Release the bus, bring the radio up, and go live.
+        ESP_LOGI(TAG, "Catch-up complete, no backlog remains; handing off to streaming");
+        sd_card_unmount();
+        if (switch_to_streaming_mode() != ESP_OK) {
+            ESP_LOGW(TAG, "Handoff to streaming failed; falling back to SD buffering");
+            switch_to_sd_mode();
         }
+        return;
     }
-    
-    // Read from current file
-    *bytes_read = fread(data, 1, len, g_state.sd_read_file);
-    
-    if (*bytes_read == 0 && feof(g_state.sd_read_file)) {
-        // Current file finished, try next one
-        ESP_LOGI(TAG, "Finished reading current file");
-        if (sd_open_next_file_for_reading() == ESP_OK && g_state.sd_read_file) {
-            // Try reading from the new file
-            *bytes_read = fread(data, 1, len, g_state.sd_read_file);
+
+    // Whether this batch reached the last backlog file we scanned. Captured now, before the
+    // radio phase, because nothing changes sd_file_count until the next SD-phase rescan.
+    bool staged_through_end = (last_staged_idx == g_state.sd_file_count - 1);
+
+    // ---- Radio phase: bus to radio, push the staged buffer ----
+    sd_card_unmount();
+    if (wifi_reconnect() != ESP_OK || stream_connect() != ESP_OK) {
+        ESP_LOGW(TAG, "Catch-up: radio/endpoint unavailable, falling back to SD buffering");
+        switch_to_sd_mode();
+        return;
+    }
+
+    esp_err_t sent = catchup_radio_phase();
+    if (sent == ESP_ERR_TIMEOUT) {
+        // Aborted early because the incoming ring was filling. The staged batch was NOT
+        // marked sent (g_staged_uploaded stays false), so the next cycle's SD phase will
+        // drain the ring and re-stage the same files; nothing is lost or double-deleted.
+        // Stay in catch-up.
+        ESP_LOGI(TAG, "Catch-up send aborted for ring pressure; cycling to drain incoming");
+        return;
+    }
+    if (sent != ESP_OK) {
+        // Send failed mid-batch. Nothing was deleted; fall back to buffering and retry later.
+        switch_to_sd_mode();
+        return;
+    }
+
+    // Batch confirmed sent. If it reached the last backlog file, this is the final batch:
+    // delete it now (delete-on-confirmed-send for the final batch) and go live. Any audio
+    // captured during this radio phase still sits in the incoming ring; the next SD-phase
+    // rescan picks it up, so we only truly go live if the rescan finds nothing.
+    if (staged_through_end) {
+        ESP_LOGI(TAG, "Final backlog batch confirmed sent; deleting and checking for new audio");
+        if (sd_card_mount() == ESP_OK) {
+            catchup_delete_confirmed();
+            sd_close_write_file();
+            sd_scan_buffered_files();   // refresh count before unmounting
         }
+        bool drained = (g_state.sd_file_count == 0);
+        sd_card_unmount();
+        if (drained && switch_to_streaming_mode() == ESP_OK) {
+            return;
+        }
+        // New audio was buffered while we sent, or handoff failed: another cycle.
+        switch_to_catchup_mode();
+        return;
     }
-    
-    if (g_state.sd_bytes_buffered >= *bytes_read) {
-        g_state.sd_bytes_buffered -= *bytes_read;
-    }
-    
-    return (*bytes_read > 0) ? ESP_OK : ESP_OK;  // Always return OK, 0 bytes means no more data
+
+    // More backlog remains: stay in catch-up for another ping-pong cycle. The confirmed
+    // batch is deleted at the start of the next cycle's SD phase.
+    ESP_LOGI(TAG, "Backlog remains beyond staged batch, continuing catch-up");
 }
 
 /* ========================== Network Management ========================== */
@@ -1190,22 +1631,15 @@ static esp_err_t switch_to_catchup_mode(void)
     
     xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
     
-    // Need to have SD files to catch up from
+    // Need a backlog to catch up from; otherwise go straight to live streaming.
     if (g_state.sd_file_count == 0) {
         ESP_LOGI(TAG, "No SD data to catch up, going directly to streaming");
         xSemaphoreGive(g_state.state_mutex);
         return switch_to_streaming_mode();
     }
     
-    // Ensure we can read from SD
-    if (!g_state.sd_read_file) {
-        if (sd_open_next_file_for_reading() != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to open SD file for catch-up");
-            xSemaphoreGive(g_state.state_mutex);
-            return ESP_FAIL;
-        }
-    }
-    
+    // Just set the mode. run_catchup_cycle() owns the SD<->radio ping-pong, including all
+    // mounting, staging, and bus handoff; there is nothing to pre-mount or pre-open here.
     g_state.mode = MODE_CATCHING_UP;
     g_state.last_catchup_pause_ms = esp_timer_get_time() / 1000;
     
@@ -1229,11 +1663,9 @@ static void stream_manager_task(void *arg)
     }
     ESP_LOGI(TAG, "Work buffer allocated: %d KB in internal RAM", SD_BLOCK_SIZE / 1024);
     
-    // Check if we need to catch up from boot
-    if (g_state.sd_file_count > 0) {
-        ESP_LOGI(TAG, "Found %d buffered files on boot, switching to catch-up mode", g_state.sd_file_count);
-        switch_to_catchup_mode();
-    }
+    // Boot mode was already chosen in app_main (STREAMING / CATCHING_UP / SD_BUFFERING)
+    // based on whether the radio, endpoint, and backlog were present. The loop below acts
+    // on g_state.mode; no override here.
     
     while (1) {
         xSemaphoreTake(g_state.state_mutex, portMAX_DELAY);
@@ -1242,26 +1674,27 @@ static void stream_manager_task(void *arg)
         
         switch (current_mode) {
             case MODE_STREAMING: {
-                // Read from incoming buffer and send to network
+                // Peek a block from the incoming ring and send it. The read pointer only
+                // advances (ring_buffer_consume) after a confirmed send, so a failed block
+                // stays at the head in order and is retried; nothing is reordered.
                 size_t available = ring_buffer_get_data_size(g_incoming_buffer);
                 if (available >= SD_BLOCK_SIZE) {
-                    size_t bytes_read = ring_buffer_read(g_incoming_buffer, work_buffer, SD_BLOCK_SIZE);
+                    size_t bytes_read = ring_buffer_peek(g_incoming_buffer, work_buffer, SD_BLOCK_SIZE);
                     if (bytes_read > 0) {
                         esp_err_t err = stream_send_with_header(work_buffer, bytes_read, g_state.sequence_number);
                         if (err == ESP_OK) {
-                            g_state.sequence_number = (g_state.sequence_number + 1) & 0xFFFFFF;
+                            ring_buffer_consume(g_incoming_buffer, bytes_read);
+                            g_state.sequence_number = seq_advance(g_state.sequence_number);
                             g_state.last_stream_write_ms = esp_timer_get_time() / 1000;
                             g_total_bytes_sent += bytes_read;
                             
                             // Reset retry count on successful send
                             g_state.stream_retry_count = 0;
                         } else {
-                            // Stream failed, try to reconnect
+                            // Stream failed; leave the block in the ring (not consumed) and
+                            // try to reconnect. The same block is re-sent on the next pass.
                             ESP_LOGE(TAG, "Stream write failed (retry %d/%d)", g_state.stream_retry_count, STREAM_MAX_RETRIES);
                             g_state.stream_healthy = false;
-                            
-                            // Put data back into buffer so we don't lose it
-                            ring_buffer_write(g_incoming_buffer, work_buffer, bytes_read);
                             
                             if (g_state.stream_retry_count < STREAM_MAX_RETRIES) {
                                 if (attempt_stream_reconnection() != ESP_OK) {
@@ -1282,25 +1715,24 @@ static void stream_manager_task(void *arg)
             }
             
             case MODE_SD_BUFFERING: {
-                // Read from incoming buffer and write to SD
+                // Peek from the incoming ring and write to SD, consuming only on a confirmed
+                // write so a failed write leaves the block in the ring in order.
                 size_t available = ring_buffer_get_data_size(g_incoming_buffer);
                 size_t free_space = ring_buffer_get_free_space(g_incoming_buffer);
                 bool did_work = false;
                 
                 if (available >= SD_BLOCK_SIZE) {
                     // Write full blocks
-                    size_t bytes_read = ring_buffer_read(g_incoming_buffer, work_buffer, SD_BLOCK_SIZE);
+                    size_t bytes_read = ring_buffer_peek(g_incoming_buffer, work_buffer, SD_BLOCK_SIZE);
                     if (bytes_read > 0) {
                         ESP_LOGI(TAG, "Writing %zu bytes to SD (full block)", bytes_read);
                         esp_err_t err = sd_write_audio_data(work_buffer, bytes_read);
                         if (err != ESP_OK) {
                             ESP_LOGE(TAG, "SD write failed!");
-                            // SD failure is critical - only try network if buffer has space
+                            // SD failure is critical - only try network if buffer has space.
+                            // The block was NOT consumed, so it is preserved either way.
                             if (free_space > (PSRAM_INCOMING_BUFFER_SIZE / 2)) {
                                 ESP_LOGW(TAG, "Attempting emergency network fallback due to SD failure");
-                                
-                                // Put data back in buffer before switching
-                                ring_buffer_write(g_incoming_buffer, work_buffer, bytes_read);
                                 
                                 // Properly unmount SD before trying network
                                 sd_card_unmount();
@@ -1316,53 +1748,57 @@ static void stream_manager_task(void *arg)
                                 ESP_LOGE(TAG, "Buffer nearly full, retrying SD write");
                             }
                         } else {
+                            ring_buffer_consume(g_incoming_buffer, bytes_read);
                             did_work = true;
                         }
                     }
                 } else if (available > 0 && free_space < SD_BLOCK_SIZE) {
                     // Buffer is getting full, flush to prevent overflow
-                    size_t bytes_read = ring_buffer_read(g_incoming_buffer, work_buffer, available);
+                    size_t bytes_read = ring_buffer_peek(g_incoming_buffer, work_buffer, available);
                     if (bytes_read > 0) {
                         ESP_LOGW(TAG, "Emergency flush: writing %zu bytes to SD", bytes_read);
                         esp_err_t err = sd_write_audio_data(work_buffer, bytes_read);
                         if (err != ESP_OK) {
                             ESP_LOGE(TAG, "Emergency flush failed!");
-                            // Put data back
-                            ring_buffer_write(g_incoming_buffer, work_buffer, bytes_read);
+                            // Not consumed; block stays in the ring for the next attempt.
                         } else {
+                            ring_buffer_consume(g_incoming_buffer, bytes_read);
                             did_work = true;
                         }
                     }
                 }
                 
-                // Check if it's time to try reconnecting
+                // Periodically probe whether the network is genuinely back. We only leave
+                // SD buffering if the radio AND the HTTP endpoint both come up. If files are
+                // waiting we enter catch-up (which owns the bus and ping-pongs them out); if
+                // none are waiting we go straight to live streaming. A failed probe leaves us
+                // buffering, with SD remounted to keep capturing audio.
                 int64_t now_ms = esp_timer_get_time() / 1000;
                 if ((now_ms - g_state.last_network_check_ms) > NETWORK_CHECK_INTERVAL_MS) {
-                    ESP_LOGI(TAG, "Attempting to reconnect to network...");
+                    ESP_LOGI(TAG, "Probing network from SD buffering...");
                     g_state.last_network_check_ms = now_ms;
                     
-                    // Close write file before unmounting
-                    if (g_state.sd_write_file) {
-                        fclose(g_state.sd_write_file);
-                        g_state.sd_write_file = NULL;
-                    }
-                    
-                    // Rescan files before switching modes
+                    // Finalize and scan the backlog, then release the bus for the radio probe.
+                    // We do NOT stage here: during SD buffering the incoming ring is kept near
+                    // empty (it is drained to SD continuously), so there is no useful batch in
+                    // RAM to send, and the real backlog lives on the card. Staging from SD on
+                    // every probe would burn a multi-MB read on each failed attempt during a
+                    // long outage. Instead, if the probe connects, the catch-up cycle stages
+                    // from SD itself (radio down) on its first pass.
+                    sd_close_write_file();
                     sd_scan_buffered_files();
-                    
-                    // Properly unmount SD before network attempt
                     sd_card_unmount();
                     
                     if (wifi_reconnect() == ESP_OK && stream_connect() == ESP_OK) {
                         if (g_state.sd_file_count > 0) {
-                            // Need to remount SD for reading
-                            sd_card_mount();
+                            // Network is back and there is a backlog: catch up. The radio is up
+                            // now; the first catch-up cycle suspends it to stage from SD.
                             switch_to_catchup_mode();
                         } else {
                             switch_to_streaming_mode();
                         }
                     } else {
-                        // Failed to reconnect, go back to SD
+                        // Still unreachable: remount SD and keep buffering.
                         sd_card_mount();
                     }
                 }
@@ -1377,83 +1813,10 @@ static void stream_manager_task(void *arg)
             }
             
             case MODE_CATCHING_UP: {
-                // Balance uploading old data with processing new data
-                size_t incoming_available = ring_buffer_get_data_size(g_incoming_buffer);
-                size_t incoming_free = ring_buffer_get_free_space(g_incoming_buffer);
-                
-                // If incoming buffer is getting full, write it to SD
-                if (incoming_free < (PSRAM_INCOMING_BUFFER_SIZE / 4)) {
-                    ESP_LOGI(TAG, "Incoming buffer filling during catch-up, writing to SD");
-                    
-                    // Need to ensure we have SD write capability
-                    if (!g_state.sd_write_file) {
-                        // Generate new filename for incoming data during catch-up
-                        int64_t timestamp = esp_timer_get_time() / 1000000;
-                        snprintf(g_state.current_write_filename, sizeof(g_state.current_write_filename),
-                                 MOUNT_POINT"/aux_%lld.bin", timestamp);
-                        
-                        g_state.sd_write_file = fopen(g_state.current_write_filename, "wb");
-                        if (!g_state.sd_write_file) {
-                            ESP_LOGE(TAG, "Failed to open SD file for catch-up overflow");
-                            // Critical error - switch back to SD mode
-                            switch_to_sd_mode();
-                            continue;
-                        }
-                        ESP_LOGI(TAG, "Opened new SD file for catch-up overflow: %s", g_state.current_write_filename);
-                    }
-                    
-                    // Write incoming data to SD
-                    while (incoming_available >= SD_BLOCK_SIZE) {
-                        size_t bytes_read = ring_buffer_read(g_incoming_buffer, work_buffer, SD_BLOCK_SIZE);
-                        if (bytes_read > 0) {
-                            sd_write_audio_data(work_buffer, bytes_read);
-                        }
-                        incoming_available = ring_buffer_get_data_size(g_incoming_buffer);
-                    }
-                    
-                    // Close write file and add to catch-up list
-                    if (g_state.sd_write_file) {
-                        fclose(g_state.sd_write_file);
-                        g_state.sd_write_file = NULL;
-                        // Rescan to include the new file
-                        sd_scan_buffered_files();
-                    }
-                }
-                
-                // Upload from SD to network
-                size_t bytes_read;
-                esp_err_t err = sd_read_audio_data(work_buffer, SD_BLOCK_SIZE, &bytes_read);
-                
-                if (err == ESP_OK && bytes_read > 0) {
-                    err = stream_send_with_header(work_buffer, bytes_read, g_state.sequence_number);
-                    if (err == ESP_OK) {
-                        g_state.sequence_number = (g_state.sequence_number + 1) & 0xFFFFFF;
-                        g_state.last_stream_write_ms = esp_timer_get_time() / 1000;
-                        g_total_bytes_sent += bytes_read;
-                    } else {
-                        ESP_LOGE(TAG, "Stream failed during catch-up");
-                        g_state.stream_healthy = false;
-                        
-                        // Try to reconnect
-                        if (g_state.stream_retry_count < STREAM_MAX_RETRIES) {
-                            if (attempt_stream_reconnection() != ESP_OK) {
-                                if (g_state.stream_retry_count >= STREAM_MAX_RETRIES) {
-                                    switch_to_sd_mode();
-                                }
-                            }
-                        } else {
-                            switch_to_sd_mode();
-                        }
-                    }
-                } else if (bytes_read == 0) {
-                    // No more data in files, check if we're completely caught up
-                    if (g_state.sd_current_file_index >= g_state.sd_file_count) {
-                        ESP_LOGI(TAG, "Caught up with all SD buffers, switching to streaming mode");
-                        switch_to_streaming_mode();
-                    }
-                }
-                
-                vTaskDelay(pdMS_TO_TICKS(1));
+                // One full ping-pong cycle: SD phase (radio off) stages the oldest file,
+                // radio phase (SD off) sends it and deletes it on confirmed receipt. The
+                // function owns the bus and decides the next mode itself.
+                run_catchup_cycle(work_buffer);
                 break;
             }
         }
@@ -1724,37 +2087,31 @@ static esp_err_t initialize_psram_buffers(void)
     }
     
     // Check if we have enough PSRAM for our buffers
-    size_t total_needed = PSRAM_INCOMING_BUFFER_SIZE + PSRAM_OUTGOING_BUFFER_SIZE + PSRAM_SWITCH_BUFFER_SIZE;
+    size_t total_needed = PSRAM_INCOMING_BUFFER_SIZE + PSRAM_STAGE_BUFFER_SIZE;
     if (psram_free < total_needed) {
         ESP_LOGE(TAG, "Not enough PSRAM! Need %zu KB, have %zu KB free", 
                  total_needed / 1024, psram_free / 1024);
         return ESP_ERR_NO_MEM;
     }
     
-    // Create incoming buffer (3MB)
+    // Create incoming USB ring buffer
     g_incoming_buffer = ring_buffer_create(PSRAM_INCOMING_BUFFER_SIZE);
     if (!g_incoming_buffer) {
         ESP_LOGE(TAG, "Failed to create incoming buffer");
         return ESP_ERR_NO_MEM;
     }
     
-    // Create outgoing buffer (3MB)
-    g_outgoing_buffer = ring_buffer_create(PSRAM_OUTGOING_BUFFER_SIZE);
-    if (!g_outgoing_buffer) {
-        ESP_LOGE(TAG, "Failed to create outgoing buffer");
+    // Allocate the flat catch-up stage buffer. This holds one whole SD file read off the
+    // card during the radio-off phase, then streamed out radio-on. It is not a ring: it
+    // is filled once per cycle and drained once per cycle.
+    g_stage_buffer = (uint8_t*)heap_caps_malloc(PSRAM_STAGE_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+    if (!g_stage_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate stage buffer in PSRAM");
         ring_buffer_destroy(g_incoming_buffer);
+        g_incoming_buffer = NULL;
         return ESP_ERR_NO_MEM;
     }
-    
-    // Allocate switch buffer (256KB) explicitly in PSRAM
-    g_switch_buffer = (uint8_t*)heap_caps_malloc(PSRAM_SWITCH_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
-    if (!g_switch_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate switch buffer in PSRAM");
-        ring_buffer_destroy(g_incoming_buffer);
-        ring_buffer_destroy(g_outgoing_buffer);
-        return ESP_ERR_NO_MEM;
-    }
-    ESP_LOGI(TAG, "Switch buffer allocated: %d KB at 0x%p", PSRAM_SWITCH_BUFFER_SIZE / 1024, g_switch_buffer);
+    ESP_LOGI(TAG, "Stage buffer allocated: %d KB at 0x%p", PSRAM_STAGE_BUFFER_SIZE / 1024, g_stage_buffer);
     
     // Show final memory status
     psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
@@ -1884,6 +2241,14 @@ static void initialize_system(void)
     }
     ESP_ERROR_CHECK(nvs_ret);
 
+    // Initialize the NVS-backed monotonic file counter. Must run after nvs_flash_init and
+    // after the boot SD scan (which sets g_max_existing_ctr), so a counter that fell behind
+    // the files on the card is bumped forward. A failure here is not fatal to streaming, but
+    // SD buffering would be unable to name files, so log loudly.
+    if (file_counter_init() != ESP_OK) {
+        ESP_LOGE(TAG, "File counter init failed; SD buffering will not be able to name files");
+    }
+
     // Initialize HaLow module (netif, driver, STA config)
     ESP_LOGI(TAG, "Initializing HaLow module...");
     if (halow_init_once() != ESP_OK) {
@@ -1903,8 +2268,8 @@ static void print_statistics_task(void *arg)
         ESP_LOGI(TAG, "Total received: %llu bytes", g_total_bytes_received);
         ESP_LOGI(TAG, "Total sent: %llu bytes", g_total_bytes_sent);
         ESP_LOGI(TAG, "Total SD written: %llu bytes", g_total_bytes_sd_written);
-        ESP_LOGI(TAG, "SD buffered: %lu bytes", g_state.sd_bytes_buffered);
-        ESP_LOGI(TAG, "SD files pending: %d", g_state.sd_file_count - g_state.sd_current_file_index);
+        ESP_LOGI(TAG, "SD bytes to catch up: %llu bytes", g_state.sd_bytes_to_catch_up);
+        ESP_LOGI(TAG, "SD files pending: %d", g_state.sd_file_count);
         ESP_LOGI(TAG, "Incoming buffer: %zu/%zu bytes", 
                  ring_buffer_get_data_size(g_incoming_buffer), PSRAM_INCOMING_BUFFER_SIZE);
         ESP_LOGI(TAG, "Network: %s, Stream: %s, Retries: %d/%d", 
@@ -1948,9 +2313,9 @@ void app_main(void)
             if (g_state.sd_file_count > 0) {
                 ESP_LOGI(TAG, "Found %d buffered files to upload, starting in CATCHING_UP mode", 
                          g_state.sd_file_count);
+                // Just set the mode. The first catch-up cycle owns the SD<->radio bus
+                // handoff; do not mount here (the radio is currently up).
                 g_state.mode = MODE_CATCHING_UP;
-                // Need to mount SD for reading
-                sd_card_mount();
             } else {
                 g_state.mode = MODE_STREAMING;
                 ESP_LOGI(TAG, "No buffered files, starting in STREAMING mode");
