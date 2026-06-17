@@ -107,34 +107,32 @@
 
 // Buffer configuration (easily changeable)
 //
-// These sizes are chosen so catch-up actually converges. The cost of a catch-up cycle is
-// dominated by the radio bring-up (~3.5 s resume + connect) plus the SD phase (~4 s mount
-// + stage), which is fixed regardless of how much we send. If each radio phase sends only
-// one inflow-cycle's worth of audio, effective uplink barely exceeds the 96 KB/s USB inflow
-// and the backlog never drains. So we amortize that fixed cost over a larger batch: the
-// stage buffer holds ~3 MB (several SD files), and SD files are 1 MB each, so a cycle sends
-// up to 3 MB per radio bring-up (~31 s of audio) against the ~20 s the cycle takes to run,
-// a comfortable net drain.
+// Catch-up is link-limited: the in-phase send rate (~1.28 Mbps measured) is the ceiling, so
+// the lever is amortizing the fixed per-cycle overhead (radio bring-up + SD mount/stage) over
+// a larger batch. The stage buffer holds 5 MB (up to five 1 MB files), so each radio bring-up
+// sends 5 MB instead of 3, raising net drain. SD files stay 1 MB so several stage together.
 //
-// Incoming ring (3 MB, ~31 s at 96 KB/s) must survive the longest radio-only phase, during
-// which USB keeps filling it. Radio phases run ~15-20 s and the ring is drained to SD at the
-// start of every cycle, so it begins each cycle near empty; 3 MB leaves clear margin while
-// freeing PSRAM for the larger stage buffer.
-#define PSRAM_INCOMING_BUFFER_SIZE  (3 * 1024 * 1024)  // 3MB incoming USB ring (~31s)
-#define PSRAM_STAGE_BUFFER_SIZE     (3 * 1024 * 1024)  // 3MB catch-up stage (several files)
+// The incoming ring is 2.5 MB. During a catch-up radio phase the ring is not drained (the bus
+// belongs to the radio); when it crosses the abort threshold below we flip back to an SD phase
+// and write out ~2 full 1 MB files, with the remaining ~0.5 MB of ring covering the audio that
+// keeps arriving during the mount/suspend transition itself. 2.5 MB ÷ 96 KB/s ≈ 26 s of live
+// headroom, and the ring is drained to SD at the start of every cycle so it begins near empty.
+#define PSRAM_INCOMING_BUFFER_SIZE  (5 * 512 * 1024)   // 2.5MB incoming USB ring (~26s)
+#define PSRAM_STAGE_BUFFER_SIZE     (5 * 1024 * 1024)  // 5MB catch-up stage (up to five files)
 #define SD_BLOCK_SIZE               (32 * 1024)        // 32KB blocks for SD writes / frames
 #define SD_MAX_WRITE_SIZE           (128 * 1024)       // Max 128KB per SD write operation
 
 // Each buffered SD file is exactly this many bytes (except a short final file at the tail
 // of a buffering burst). 1 MB keeps files small enough that several stage together into the
-// 3 MB stage buffer, amortizing the per-cycle radio bring-up over more data. Must be a
+// 5 MB stage buffer, amortizing the per-cycle radio bring-up over more data. Must be a
 // multiple of SD_BLOCK_SIZE (1MB / 32KB = 32) and of the 512-byte sector size.
 #define SD_FILE_SIZE                (1 * 1024 * 1024)
 
-// During a catch-up radio phase the incoming ring is not being drained. If it
-// climbs past this fraction of capacity we abort the upload early and go back to
-// the SD phase to drain it, so live audio is never lost to overflow.
-#define CATCHUP_INCOMING_ABORT_NUM  85
+// During a catch-up radio phase the incoming ring is not being drained. If it climbs past this
+// fraction of capacity we abort the upload early and flip back to an SD phase to drain it, so
+// live audio is never lost to overflow. 80% of the 2.5 MB ring = 2 MB, i.e. two full 1 MB
+// files' worth, leaving the remaining 0.5 MB to absorb audio arriving during the transition.
+#define CATCHUP_INCOMING_ABORT_NUM  80
 #define CATCHUP_INCOMING_ABORT_DEN  100
 
 // NVS-backed monotonic file counter. We reserve a block of IDs at a time and hand
@@ -150,7 +148,6 @@
 #define STREAM_RETRY_DELAY_MS       5000   // Delay between stream reconnection attempts
 #define STREAM_MAX_RETRIES          2       // Number of stream reconnection attempts before SD mode
 #define NETWORK_CHECK_INTERVAL_MS   20000  // Check network every 20 seconds when on SD
-#define CATCHUP_PAUSE_INTERVAL_MS   10000  // Pause catch-up every 10 seconds to write new data
 #define STREAM_HEALTH_CHECK_MS      10000  // Check stream health every 10 seconds
 
 // Audio data rate: 96 bytes/ms = 96KB/s = 768kbps
@@ -1425,6 +1422,20 @@ static esp_err_t halow_init_once(void)
     return ESP_OK;
 }
 
+// Log the HaLow link signal strength. RSSI (dBm) is the cheapest, most diagnostic number:
+// a low/poor RSSI forces the rate-control algorithm onto a low MCS, which caps goodput and
+// is the likely cause if catch-up throughput is far below the PHY ceiling. Only valid while
+// the STA is connected. (For the actual negotiated TX rate/MCS, morselib exposes
+// mmwlan_get_rc_stats(), which returns a heap struct that must be freed; not used here.)
+static void log_halow_link(const char *context)
+{
+    if (mmwlan_get_sta_state() != MMWLAN_STA_CONNECTED) {
+        return;
+    }
+    int32_t rssi = mmwlan_get_rssi();
+    ESP_LOGI(TAG, "HaLow link [%s]: RSSI %ld dBm", context, (long)rssi);
+}
+
 // Re-boot the radio and (re)connect after a suspend. mmwlan_sta_enable() auto-boots the
 // chip if powered down (re-initializing the SPI transport via the shim) and initiates the
 // association. Link-up arrives asynchronously via halow_sta_status_cb. No netif recreation.
@@ -1471,6 +1482,7 @@ static esp_err_t halow_resume(void)
 
     g_state.wifi_connected = true;
     g_state.network_healthy = true;
+    log_halow_link("connect");
     return ESP_OK;
 }
 
@@ -2283,6 +2295,9 @@ static void print_statistics_task(void *arg)
         ESP_LOGI(TAG, "PSRAM: %zu/%zu KB free (%.1f%% used)", 
                  psram_free / 1024, psram_total / 1024,
                  ((psram_total - psram_free) * 100.0) / psram_total);
+
+        // HaLow signal (only meaningful when the radio is up, i.e. STREAMING / radio phase).
+        log_halow_link("stats");
     }
 }
 
