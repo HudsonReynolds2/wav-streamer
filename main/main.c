@@ -610,7 +610,7 @@ static esp_err_t sd_scan_buffered_files(void)
                 g_state.sd_file_list[index].filename[sizeof(g_state.sd_file_list[index].filename) - 1] = '\0';  // Ensure null termination
                 
                 // Extract timestamp from filename (aux_TIMESTAMP.bin)
-                char *timestamp_str = strstr(entry->d_name, "aux_") + strlen("audio_buffer_");
+                char *timestamp_str = strstr(entry->d_name, "aux_") + strlen("aux_");
                 g_state.sd_file_list[index].timestamp = atoll(timestamp_str);
                 
                 index++;
@@ -737,7 +737,7 @@ static esp_err_t sd_write_audio_data(const uint8_t *data, size_t len)
         // Generate filename with timestamp
         int64_t timestamp = esp_timer_get_time() / 1000000; // Convert to seconds
         snprintf(g_state.current_write_filename, sizeof(g_state.current_write_filename),
-                 MOUNT_POINT"/wavbuf_%lld.bin", timestamp);
+                 MOUNT_POINT"/aux_%lld.bin", timestamp);
         
         // Make sure to close any stale file handle first
         if (g_state.sd_write_file) {
@@ -1390,7 +1390,7 @@ static void stream_manager_task(void *arg)
                         // Generate new filename for incoming data during catch-up
                         int64_t timestamp = esp_timer_get_time() / 1000000;
                         snprintf(g_state.current_write_filename, sizeof(g_state.current_write_filename),
-                                 MOUNT_POINT"/wavbuf_%lld.bin", timestamp);
+                                 MOUNT_POINT"/aux_%lld.bin", timestamp);
                         
                         g_state.sd_write_file = fopen(g_state.current_write_filename, "wb");
                         if (!g_state.sd_write_file) {
