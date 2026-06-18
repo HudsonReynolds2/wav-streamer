@@ -351,6 +351,14 @@ static uint32_t g_total_stream_failures = 0;
 static uint32_t g_total_sd_fallbacks = 0;
 static uint32_t g_total_catchup_aborts = 0;
 
+// Data-loss (incoming ring overflow) tracking, used for edge-triggered logging in isoc_in_cb
+// so a sustained overflow logs once on entry and once on recovery rather than every callback.
+// g_losing_data is the current state, g_lost_bytes_run accumulates bytes within the current
+// loss run (reset when it ends), and g_total_bytes_lost is the lifetime total since boot.
+static volatile bool     g_losing_data = false;
+static volatile uint32_t g_lost_bytes_run = 0;
+static uint64_t          g_total_bytes_lost = 0;
+
 // NVS-backed monotonic file counter (see NVS_COUNTER_* defines). g_file_ctr_next is
 // the next ID to hand out; g_file_ctr_block_end is the first ID we have NOT yet
 // reserved from NVS. g_max_existing_ctr is the highest ID found on the card at boot,
@@ -1634,7 +1642,9 @@ static void log_halow_link(const char *context)
             uint32_t bw_field = (ri >> MMWLAN_RC_STATS_RATE_INFO_BW_OFFSET)    & 0x3;
             uint32_t mcs      = (ri >> MMWLAN_RC_STATS_RATE_INFO_RATE_OFFSET)  & 0xF;
             uint32_t sgi      = (ri >> MMWLAN_RC_STATS_RATE_INFO_GUARD_OFFSET) & 0x1;
-            // BW codes: 0=1MHz, 1=2MHz, 2=4MHz, 3=8MHz. Anything else is surfaced raw below.
+            // BW codes: 0=1MHz, 1=2MHz, 2=4MHz, 3=8MHz. The header enum only documents 0-2,
+            // but the MM8108 (chip 0x0306) adds 8 MHz, which reports as code 3. Anything else is
+            // surfaced raw below.
             const char *bw_str = (bw_field == 0) ? "1MHz" :
                                  (bw_field == 1) ? "2MHz" :
                                  (bw_field == 2) ? "4MHz" :
@@ -2180,10 +2190,28 @@ static void isoc_in_cb(usb_transfer_t *t)
     // Write to incoming ring buffer
     if (out > 0) {
         size_t written = ring_buffer_write(g_incoming_buffer, c->batch_buf, out);
-        if (written < out) {
-            ESP_LOGW(TAG, "Incoming buffer overflow! Lost %zu bytes", out - written);
-        }
         g_total_bytes_received += written;
+
+        // Edge-triggered loss reporting. This callback fires continuously, so logging every
+        // dropped batch floods the console during a sustained overflow. Instead we log once
+        // when loss begins ("Losing data!") and once when it ends (with the total dropped),
+        // staying silent for the steady-state in between. g_losing_data and g_lost_bytes_run
+        // are file-scope (declared near the stats globals) and only touched here.
+        if (written < out) {
+            size_t dropped = out - written;
+            g_lost_bytes_run += dropped;
+            g_total_bytes_lost += dropped;
+            if (!g_losing_data) {
+                g_losing_data = true;
+                ESP_LOGW(TAG, "Losing data! Incoming ring full (audio is being dropped)");
+            }
+        } else if (g_losing_data) {
+            // First clean write after a loss run: report the run total once, then go quiet.
+            ESP_LOGW(TAG, "Data loss ended: dropped %llu bytes during that overflow",
+                     (unsigned long long)g_lost_bytes_run);
+            g_losing_data = false;
+            g_lost_bytes_run = 0;
+        }
     }
 
     // Re-submit URB
@@ -2582,6 +2610,14 @@ static void print_statistics_task(void *arg)
                  (unsigned long)g_total_stream_failures,
                  (unsigned long)g_total_sd_fallbacks,
                  (unsigned long)g_total_catchup_aborts);
+
+        // Only surface data loss if any has occurred; in the normal no-loss case this stays
+        // silent. Flags whether loss is happening right now versus a past total.
+        if (g_total_bytes_lost > 0) {
+            ESP_LOGW(TAG, "Data lost: %s total since boot%s",
+                     human_bytes(g_total_bytes_lost, b1, sizeof(b1)),
+                     g_losing_data ? " (LOSING NOW)" : "");
+        }
 
         // PSRAM usage info.
         size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
