@@ -172,6 +172,18 @@
 #define STREAM_FAIL_SD_HIGHWATER_NUM   60
 #define STREAM_FAIL_SD_HIGHWATER_DEN  100
 
+// First-connect warm-up. After a fresh radio bring-up the HaLow rate controller sits at
+// MCS0/1MHz and has not adapted, so the opening TCP SYN frequently times out for a second or
+// two even with excellent RSSI (observed: a full connect timeout on the first attempt, then
+// an instant success on the next try once the link rate-adapted). Retry the cheap TCP open a
+// few times before tearing the radio back down and eating a NETWORK_CHECK_INTERVAL_MS wait.
+// Reuses the live-reconnect probe timing (RECONNECT_PROBE_TIMEOUT_MS / _GAP_MS); only the
+// attempt count is new. ~4 attempts at the 1 s probe timeout spans the few seconds the rate
+// controller needs to climb off MCS0, while returning the instant a try connects. Each short
+// attempt also re-sends SYNs, which is the very traffic that ramps the link (an idle settle
+// delay would not, since rate control only adapts when frames flow).
+#define STREAM_CONNECT_WARMUP_ATTEMPTS  4
+
 // Audio data rate: 96 bytes/ms = 96KB/s = 768kbps
 #define AUDIO_DATA_RATE_BPS         768000
 #define AUDIO_BYTES_PER_MS          96
@@ -371,6 +383,12 @@ static uint32_t g_total_catchup_aborts = 0;
 static volatile bool     g_losing_data = false;
 static volatile uint32_t g_lost_bytes_run = 0;
 static uint64_t          g_total_bytes_lost = 0;
+
+// Edge-triggered SD-buffering write-run tracking (see sd_write_run_note / sd_write_run_end).
+// Replaces the per-block SD write log: one line when a buffering run begins, one when it ends.
+static bool     g_sd_run_active = false;
+static uint64_t g_sd_run_bytes = 0;
+static int64_t  g_sd_run_start_ms = 0;
 
 // NVS-backed monotonic file counter (see NVS_COUNTER_* defines). g_file_ctr_next is
 // the next ID to hand out; g_file_ctr_block_end is the first ID we have NOT yet
@@ -635,6 +653,38 @@ static esp_err_t stream_connect(void)
     
     ESP_LOGI(TAG, "Streaming connection established");
     return ESP_OK;
+}
+
+// Open the stream with a few quick retries, for use right after a radio bring-up where the
+// link has not yet rate-adapted. Mirrors the probe loop in handle_stream_failure() but for
+// the cold-link connect rather than the live-stream reconnect, and borrows the same probe
+// timing. Returns ESP_OK on the first attempt that connects, or the last error after
+// exhausting the attempts. stream_connect() itself stays single-shot so handle_stream_failure()
+// (which has its own ring-pressure-gated loop) does not nest retries.
+static esp_err_t stream_connect_resilient(void)
+{
+    const int saved_timeout = g_stream_connect_timeout_ms;
+    g_stream_connect_timeout_ms = RECONNECT_PROBE_TIMEOUT_MS;
+
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 1; attempt <= STREAM_CONNECT_WARMUP_ATTEMPTS; attempt++) {
+        err = stream_connect();
+        if (err == ESP_OK) {
+            if (attempt > 1) {
+                ESP_LOGI(TAG, "Stream connect succeeded on attempt %d/%d",
+                         attempt, STREAM_CONNECT_WARMUP_ATTEMPTS);
+            }
+            break;
+        }
+        if (attempt < STREAM_CONNECT_WARMUP_ATTEMPTS) {
+            ESP_LOGW(TAG, "Stream connect attempt %d/%d failed (%s); link likely still ramping, retrying",
+                     attempt, STREAM_CONNECT_WARMUP_ATTEMPTS, esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(RECONNECT_PROBE_GAP_MS));
+        }
+    }
+
+    g_stream_connect_timeout_ms = saved_timeout;
+    return err;
 }
 
 static esp_err_t stream_send_with_header(const uint8_t *data, size_t data_len, uint32_t seq)
@@ -1485,7 +1535,7 @@ static void run_catchup_cycle(uint8_t *work_buffer)
 
     // ---- Radio phase: bus to radio, push the staged buffer ----
     sd_card_unmount();
-    if (wifi_reconnect() != ESP_OK || stream_connect() != ESP_OK) {
+    if (wifi_reconnect() != ESP_OK || stream_connect_resilient() != ESP_OK) {
         ESP_LOGW(TAG, "Catch-up: radio/endpoint unavailable, falling back to SD buffering");
         switch_to_sd_mode();
         return;
@@ -2046,6 +2096,41 @@ static esp_err_t switch_to_catchup_mode(void)
     return ESP_OK;
 }
 
+// Edge-triggered SD-buffering write run. The old per-block "Writing 32 KB to SD" line printed
+// ~3x/s and buried the log. Instead we announce once when a buffering run starts and once when
+// it ends, reporting how much audio landed on the card and the effective write rate, the same
+// shape as the data-loss run logging. Counts only the live SD_BUFFERING path, not catch-up
+// drains (which are already quiet).
+static void sd_write_run_note(size_t n)
+{
+    if (!g_sd_run_active) {
+        g_sd_run_active = true;
+        g_sd_run_start_ms = esp_timer_get_time() / 1000;
+        g_sd_run_bytes = 0;
+        ESP_LOGI(TAG, "SD buffering: network down, writing audio to card");
+    }
+    g_sd_run_bytes += n;
+}
+
+static void sd_write_run_end(void)
+{
+    if (!g_sd_run_active) return;
+    int64_t dur_ms = (esp_timer_get_time() / 1000) - g_sd_run_start_ms;
+    char b1[24];
+    if (dur_ms > 0) {
+        double kbps = (double)g_sd_run_bytes / 1024.0 / ((double)dur_ms / 1000.0);
+        ESP_LOGI(TAG, "SD buffering ended: wrote %s in %lld.%01lld s (%.0f KB/s avg)",
+                 human_bytes(g_sd_run_bytes, b1, sizeof(b1)),
+                 (long long)(dur_ms / 1000), (long long)((dur_ms % 1000) / 100),
+                 kbps);
+    } else {
+        ESP_LOGI(TAG, "SD buffering ended: wrote %s",
+                 human_bytes(g_sd_run_bytes, b1, sizeof(b1)));
+    }
+    g_sd_run_active = false;
+    g_sd_run_bytes = 0;
+}
+
 /* ========================== Stream Manager Task ========================== */
 static void stream_manager_task(void *arg)
 {
@@ -2069,6 +2154,13 @@ static void stream_manager_task(void *arg)
         stream_mode_t current_mode = g_state.mode;
         xSemaphoreGive(g_state.state_mutex);
         
+        // Close any open SD-buffering write run when we leave SD_BUFFERING, emitting the
+        // edge-triggered summary (bytes written + effective rate) in place of the old
+        // per-block line.
+        if (current_mode != MODE_SD_BUFFERING && g_sd_run_active) {
+            sd_write_run_end();
+        }
+
         switch (current_mode) {
             case MODE_STREAMING: {
                 // Peek a block from the incoming ring and send it. The read pointer only
@@ -2112,7 +2204,6 @@ static void stream_manager_task(void *arg)
                     // Write full blocks
                     size_t bytes_read = ring_buffer_peek(g_incoming_buffer, work_buffer, SD_BLOCK_SIZE);
                     if (bytes_read > 0) {
-                        ESP_LOGI(TAG, "Writing %zu bytes to SD (full block)", bytes_read);
                         esp_err_t err = sd_write_audio_data(work_buffer, bytes_read);
                         if (err != ESP_OK) {
                             ESP_LOGE(TAG, "SD write failed!");
@@ -2124,7 +2215,7 @@ static void stream_manager_task(void *arg)
                                 // Properly unmount SD before trying network
                                 sd_card_unmount();
                                 
-                                if (wifi_reconnect() == ESP_OK && stream_connect() == ESP_OK) {
+                                if (wifi_reconnect() == ESP_OK && stream_connect_resilient() == ESP_OK) {
                                     switch_to_streaming_mode();
                                 } else {
                                     // Network failed too, go back to SD
@@ -2136,6 +2227,7 @@ static void stream_manager_task(void *arg)
                             }
                         } else {
                             ring_buffer_consume(g_incoming_buffer, bytes_read);
+                            sd_write_run_note(bytes_read);
                             did_work = true;
                         }
                     }
@@ -2143,13 +2235,13 @@ static void stream_manager_task(void *arg)
                     // Buffer is getting full, flush to prevent overflow
                     size_t bytes_read = ring_buffer_peek(g_incoming_buffer, work_buffer, available);
                     if (bytes_read > 0) {
-                        ESP_LOGW(TAG, "Emergency flush: writing %zu bytes to SD", bytes_read);
                         esp_err_t err = sd_write_audio_data(work_buffer, bytes_read);
                         if (err != ESP_OK) {
                             ESP_LOGE(TAG, "Emergency flush failed!");
                             // Not consumed; block stays in the ring for the next attempt.
                         } else {
                             ring_buffer_consume(g_incoming_buffer, bytes_read);
+                            sd_write_run_note(bytes_read);
                             did_work = true;
                         }
                     }
@@ -2176,7 +2268,7 @@ static void stream_manager_task(void *arg)
                     sd_scan_buffered_files();
                     sd_card_unmount();
                     
-                    if (wifi_reconnect() == ESP_OK && stream_connect() == ESP_OK) {
+                    if (wifi_reconnect() == ESP_OK && stream_connect_resilient() == ESP_OK) {
                         if (g_state.sd_file_count > 0) {
                             // Network is back and there is a backlog: catch up. The radio is up
                             // now; the first catch-up cycle suspends it to stage from SD.
@@ -2224,7 +2316,10 @@ static void network_monitor_task(void *arg)
         stream_mode_t current_mode = g_state.mode;
         xSemaphoreGive(g_state.state_mutex);
         
-        if (current_mode == MODE_STREAMING || current_mode == MODE_CATCHING_UP) {
+        // Skip the health check while SD owns the bus during a catch-up SD phase: the radio
+        // is intentionally suspended then, so a "failure" would be spurious log noise.
+        if (current_mode == MODE_STREAMING ||
+            (current_mode == MODE_CATCHING_UP && !g_state.sd_mounted)) {
             bool network_ok = check_network_health();
             
             if (!network_ok) {
