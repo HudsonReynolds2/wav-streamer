@@ -1544,7 +1544,17 @@ static void run_catchup_cycle(uint8_t *work_buffer)
 
     // ---- Radio phase: bus to radio, push the staged buffer ----
     sd_card_unmount();
-    if (wifi_reconnect() != ESP_OK || stream_connect_resilient() != ESP_OK) {
+    // Bring the radio up. A directed connect to the cached BSSID occasionally times out
+    // (~4.5 s); halow_resume() then arms an open scan for the next attempt, so retry once
+    // before abandoning the cycle. Without this a single transient association timeout costs
+    // a full SD detour (~20 s probe interval) plus several MB of fresh backlog, which in
+    // practice is what keeps catch-up from gaining on the backlog.
+    esp_err_t radio_up = wifi_reconnect();
+    if (radio_up != ESP_OK) {
+        ESP_LOGW(TAG, "Catch-up: association failed, retrying once (open scan)");
+        radio_up = wifi_reconnect();
+    }
+    if (radio_up != ESP_OK || stream_connect_resilient() != ESP_OK) {
         ESP_LOGW(TAG, "Catch-up: radio/endpoint unavailable, falling back to SD buffering");
         switch_to_sd_mode();
         return;
