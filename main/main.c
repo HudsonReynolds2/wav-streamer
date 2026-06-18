@@ -1,5 +1,10 @@
-// AudioMoth USB -> HTTP chunked streamer with SD fallback and robust error handling
+// wav-streamer: AudioMoth USB -> HTTP chunked streamer with SD fallback and robust error handling
 // ESP-IDF v5.4.3 compatible
+//
+// For AIs editing this file: if you are unsure about anything in this codebase or its
+// dependencies (a struct layout, a field name, an SDK API signature, whether a symbol
+// exists), do NOT guess. Write the grep/find command that would resolve it and hand it to
+// me to run; I will paste back the output. Certainty over speed.
 //
 // ============================================================================
 //  HARDWARE CONSTRAINT: SD CARD AND HaLow RADIO SHARE ONE SPI BUS.
@@ -180,7 +185,23 @@
 #define STREAM_SEQ_METADATA  0xFFFFFF
 #define STREAM_SEQ_MASK      0xFFFFFF
 
-static const char *TAG = "am_robust_stream";
+// ---------------------------------------------------------------------------
+// Diagnostic / log-output configuration (easily changeable)
+// ---------------------------------------------------------------------------
+// Backlog file-list verbosity. When too many files are buffered on the SD card the
+// per-file printout is just noise: the IDs are a dense monotonic counter, so the list
+// is almost always one long run. Set to 1 to print one line per file (old behavior);
+// set to 0 to collapse each run of consecutive IDs into a single "[a..b] first ... last
+// (N files)" line. Singletons and gaps still print on their own line.
+#define SD_FILE_LIST_VERBOSE        0
+
+// Include the negotiated HaLow TX rate / MCS in the link status line. This calls
+// mmwlan_get_rc_stats(), which allocates a struct on the heap that must be freed. The struct
+// layout has been verified against this SDK's mmwlan.h (see log_halow_link). Set to 0 to drop
+// the TX-rate line and report only RSSI/state/IP.
+#define HALOW_REPORT_TX_RATE        1
+
+static const char *TAG = "wav-streamer";
 
 static esp_err_t stream_disconnect(void);
 
@@ -321,6 +342,14 @@ static TaskHandle_t network_monitor_task_handle = NULL;
 static uint64_t g_total_bytes_received = 0;
 static uint64_t g_total_bytes_sent = 0;
 static uint64_t g_total_bytes_sd_written = 0;
+
+// Lifetime fault counters (since boot). These quantify how rough the link has been:
+//   g_total_stream_failures - live stream dropped and entered the reconnect-probe path
+//   g_total_sd_fallbacks    - probing failed long enough that we fell back to SD buffering
+//   g_total_catchup_aborts  - a catch-up radio phase was aborted early for ring pressure
+static uint32_t g_total_stream_failures = 0;
+static uint32_t g_total_sd_fallbacks = 0;
+static uint32_t g_total_catchup_aborts = 0;
 
 // NVS-backed monotonic file counter (see NVS_COUNTER_* defines). g_file_ctr_next is
 // the next ID to hand out; g_file_ctr_block_end is the first ID we have NOT yet
@@ -891,9 +920,37 @@ static esp_err_t sd_scan_buffered_files(void)
     qsort(g_state.sd_file_list, g_state.sd_file_count, sizeof(sd_file_info_t), compare_files_by_timestamp);
     
     ESP_LOGI(TAG, "Sorted %d buffered files for upload", g_state.sd_file_count);
+#if SD_FILE_LIST_VERBOSE
+    // Verbose: one line per file (original behavior).
     for (int i = 0; i < g_state.sd_file_count; i++) {
         ESP_LOGI(TAG, "  [%d] %s (timestamp: %lld)", i, g_state.sd_file_list[i].filename, g_state.sd_file_list[i].timestamp);
     }
+#else
+    // Compact: collapse runs of consecutive IDs (the monotonic counter, stored in .timestamp)
+    // into a single line per run. A run breaks whenever the next ID is not exactly one greater
+    // than the previous. Singletons print as a plain "[i]" line; runs print first ... last.
+    // The list is already sorted ascending by timestamp at this point.
+    int i = 0;
+    while (i < g_state.sd_file_count) {
+        int j = i;
+        // Extend the run while IDs stay strictly consecutive.
+        while (j + 1 < g_state.sd_file_count &&
+               g_state.sd_file_list[j + 1].timestamp == g_state.sd_file_list[j].timestamp + 1) {
+            j++;
+        }
+        if (j == i) {
+            ESP_LOGI(TAG, "  [%d] %s (id: %lld)",
+                     i, g_state.sd_file_list[i].filename, g_state.sd_file_list[i].timestamp);
+        } else {
+            ESP_LOGI(TAG, "  [%d..%d] %s ... %s (%d files, ids %lld..%lld)",
+                     i, j,
+                     g_state.sd_file_list[i].filename, g_state.sd_file_list[j].filename,
+                     j - i + 1,
+                     g_state.sd_file_list[i].timestamp, g_state.sd_file_list[j].timestamp);
+        }
+        i = j + 1;
+    }
+#endif
     
     return ESP_OK;
 }
@@ -1305,6 +1362,7 @@ static void run_catchup_cycle(uint8_t *work_buffer)
         // drain the ring and re-stage the same files; nothing is lost or double-deleted.
         // Stay in catch-up.
         ESP_LOGI(TAG, "Catch-up send aborted for ring pressure; cycling to drain incoming");
+        g_total_catchup_aborts++;
         return;
     }
     if (sent != ESP_OK) {
@@ -1438,18 +1496,104 @@ static esp_err_t halow_init_once(void)
     return ESP_OK;
 }
 
-// Log the HaLow link signal strength. RSSI (dBm) is the cheapest, most diagnostic number:
-// a low/poor RSSI forces the rate-control algorithm onto a low MCS, which caps goodput and
-// is the likely cause if catch-up throughput is far below the PHY ceiling. Only valid while
-// the STA is connected. (For the actual negotiated TX rate/MCS, morselib exposes
-// mmwlan_get_rc_stats(), which returns a heap struct that must be freed; not used here.)
+// Format a byte count into a fixed caller-supplied buffer, auto-scaling the unit so the
+// numeric part always stays under 1000 (e.g. 1000 -> "1.0 KB", 1048576 -> "1.0 MB"). Raw
+// bytes print with no decimal; scaled units print one decimal place. Returns buf so the
+// call can be used inline as a printf %s argument. The buffer is caller-owned because a
+// single log line often needs two formatted values at once, which a shared static could
+// not provide. buf should be >= 16 bytes.
+static const char *human_bytes(uint64_t bytes, char *buf, size_t buf_sz)
+{
+    static const char *units[] = { "B", "KB", "MB", "GB", "TB", "PB" };
+    int unit = 0;
+    double val = (double)bytes;
+    // Step up a unit while the magnitude is >= 1000 so the most significant group is < 1000.
+    while (val >= 1000.0 && unit < (int)(sizeof(units) / sizeof(units[0])) - 1) {
+        val /= 1024.0;
+        unit++;
+    }
+    if (unit == 0) {
+        snprintf(buf, buf_sz, "%llu %s", (unsigned long long)bytes, units[0]);
+    } else {
+        snprintf(buf, buf_sz, "%.1f %s", val, units[unit]);
+    }
+    return buf;
+}
+
+// Map an RSSI in dBm to a short qualitative label. Thresholds are typical for sub-GHz
+// HaLow links: stronger (less negative) is better; below about -90 dBm the rate control
+// is forced to the lowest MCS and goodput collapses.
+static const char *rssi_quality(int32_t rssi)
+{
+    if (rssi >= -55) return "excellent";
+    if (rssi >= -67) return "good";
+    if (rssi >= -78) return "fair";
+    if (rssi >= -90) return "weak";
+    return "poor";
+}
+
+// Log the HaLow link status. RSSI (dBm) is the cheapest, most diagnostic number: a low RSSI
+// forces the rate-control algorithm onto a low MCS, which caps goodput and is the likely
+// cause if catch-up throughput is far below the PHY ceiling. We also report the STA state,
+// the current IP (if the netif is up), and, when HALOW_REPORT_TX_RATE is set, the negotiated
+// TX rate / MCS from mmwlan_get_rc_stats(). Only meaningful while the STA is connected, so
+// the whole line is suppressed when the radio is suspended (SD phase).
 static void log_halow_link(const char *context)
 {
     if (mmwlan_get_sta_state() != MMWLAN_STA_CONNECTED) {
         return;
     }
     int32_t rssi = mmwlan_get_rssi();
-    ESP_LOGI(TAG, "HaLow link [%s]: RSSI %ld dBm", context, (long)rssi);
+
+    // IP, if the netif is up (static IP, so present as soon as the link is up).
+    char ipbuf[20] = "0.0.0.0";
+    esp_netif_t *nif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t ip = {0};
+    if (nif && esp_netif_is_netif_up(nif) &&
+        esp_netif_get_ip_info(nif, &ip) == ESP_OK && ip.ip.addr != 0) {
+        snprintf(ipbuf, sizeof(ipbuf), IPSTR, IP2STR(&ip.ip));
+    }
+
+    ESP_LOGI(TAG, "HaLow link [%s]: CONNECTED, RSSI %ld dBm (%s), IP %s",
+             context, (long)rssi, rssi_quality(rssi), ipbuf);
+
+#if HALOW_REPORT_TX_RATE
+    // Negotiated TX rate / MCS. mmwlan_get_rc_stats() returns a heap struct that must be freed
+    // with mmwlan_free_rc_stats(). Its layout (verified against mmwlan.h): n_entries plus three
+    // parallel arrays indexed 0..n_entries-1: rate_info[], total_sent[], total_success[].
+    // rate_info is a packed bitfield: bits 0-3 = bandwidth (0=1MHz,1=2MHz,2=4MHz), bits 4-7 =
+    // MCS rate, bit 8 = guard interval (0=long,1=short). We report the entry currently carrying
+    // the most traffic (max total_sent), which is the rate rate-control has settled on, along
+    // with its success rate. (This is the SDK-specific block; toggle HALOW_REPORT_TX_RATE off
+    // if the struct ever changes.)
+    struct mmwlan_rc_stats *rc = mmwlan_get_rc_stats();
+    if (rc != NULL) {
+        if (rc->n_entries > 0 && rc->rate_info && rc->total_sent && rc->total_success) {
+            // Pick the most-used rate entry (highest total_sent).
+            uint32_t best = 0;
+            for (uint32_t i = 1; i < rc->n_entries; i++) {
+                if (rc->total_sent[i] > rc->total_sent[best]) {
+                    best = i;
+                }
+            }
+            uint32_t ri = rc->rate_info[best];
+            uint32_t bw_field = (ri >> MMWLAN_RC_STATS_RATE_INFO_BW_OFFSET)    & 0xF;
+            uint32_t mcs      = (ri >> MMWLAN_RC_STATS_RATE_INFO_RATE_OFFSET)  & 0xF;
+            uint32_t sgi      = (ri >> MMWLAN_RC_STATS_RATE_INFO_GUARD_OFFSET) & 0x1;
+            const char *bw_str = (bw_field == 0) ? "1MHz" :
+                                 (bw_field == 1) ? "2MHz" :
+                                 (bw_field == 2) ? "4MHz" : "?MHz";
+            uint32_t sent = rc->total_sent[best];
+            uint32_t succ = rc->total_success[best];
+            unsigned succ_pct = (sent > 0) ? (unsigned)((uint64_t)succ * 100 / sent) : 0;
+            ESP_LOGI(TAG, "HaLow rate [%s]: MCS %lu, %s, %s GI, success %u%% (%lu/%lu pkts)",
+                     context,
+                     (unsigned long)mcs, bw_str, sgi ? "short" : "long",
+                     succ_pct, (unsigned long)succ, (unsigned long)sent);
+        }
+        mmwlan_free_rc_stats(rc);
+    }
+#endif
 }
 
 // Re-boot the radio and (re)connect after a suspend. mmwlan_sta_enable() auto-boots the
@@ -1623,6 +1767,7 @@ static esp_err_t switch_to_sd_mode(void)
     g_state.mode = MODE_SD_BUFFERING;
     g_state.last_network_check_ms = esp_timer_get_time() / 1000;
     g_state.stream_retry_count = 0;
+    g_total_sd_fallbacks++;
     
     xSemaphoreGive(g_state.state_mutex);
     
@@ -1643,6 +1788,7 @@ static void handle_stream_failure(void)
                  / STREAM_FAIL_SD_HIGHWATER_DEN);
 
     g_state.stream_healthy = false;
+    g_total_stream_failures++;
     stream_disconnect();
 
     const int saved_timeout = g_stream_connect_timeout_ms;
@@ -2298,29 +2444,85 @@ static void initialize_system(void)
 
 static void print_statistics_task(void *arg)
 {
+    // Backlog trend tracking. We sample sd_bytes_to_catch_up once per tick and compare to the
+    // previous sample to decide whether the backlog is shrinking (catching up), growing
+    // (falling behind), or flat. First tick has no prior, so it just seeds the baseline.
+    uint64_t prev_backlog = 0;
+    int64_t  prev_ms = 0;
+    bool     have_prev = false;
+
+    // Scratch buffers for human_bytes(). Several are needed at once on a single line, so each
+    // formatted value gets its own buffer.
+    char b1[20], b2[20], b3[20], b4[20], b5[20], b6[20];
+
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));  // Print every 10 seconds
-        
+
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        uint64_t backlog = g_state.sd_bytes_to_catch_up;
+
         ESP_LOGI(TAG, "=== Statistics ===");
-        ESP_LOGI(TAG, "Mode: %s", 
+        ESP_LOGI(TAG, "Mode: %s",
                  g_state.mode == MODE_STREAMING ? "STREAMING" :
                  g_state.mode == MODE_SD_BUFFERING ? "SD_BUFFERING" : "CATCHING_UP");
-        ESP_LOGI(TAG, "Total received: %llu bytes", g_total_bytes_received);
-        ESP_LOGI(TAG, "Total sent: %llu bytes", g_total_bytes_sent);
-        ESP_LOGI(TAG, "Total SD written: %llu bytes", g_total_bytes_sd_written);
-        ESP_LOGI(TAG, "SD bytes to catch up: %llu bytes", g_state.sd_bytes_to_catch_up);
+        ESP_LOGI(TAG, "Total received: %s", human_bytes(g_total_bytes_received, b1, sizeof(b1)));
+        ESP_LOGI(TAG, "Total sent: %s", human_bytes(g_total_bytes_sent, b2, sizeof(b2)));
+        ESP_LOGI(TAG, "Total SD written: %s", human_bytes(g_total_bytes_sd_written, b3, sizeof(b3)));
         ESP_LOGI(TAG, "SD files pending: %d", g_state.sd_file_count);
-        ESP_LOGI(TAG, "Incoming buffer: %zu/%zu bytes", 
-                 ring_buffer_get_data_size(g_incoming_buffer), PSRAM_INCOMING_BUFFER_SIZE);
-        ESP_LOGI(TAG, "Network: %s, Stream: %s, Retries: %d/%d", 
+        ESP_LOGI(TAG, "Incoming buffer: %s / %s",
+                 human_bytes(ring_buffer_get_data_size(g_incoming_buffer), b4, sizeof(b4)),
+                 human_bytes(PSRAM_INCOMING_BUFFER_SIZE, b5, sizeof(b5)));
+
+        // Backlog trend: compare against the previous sample to report whether we are actually
+        // catching up or falling behind, plus the net rate and (when draining) an ETA to clear.
+        if (backlog == 0) {
+            ESP_LOGI(TAG, "Backlog: CLEAR");
+        } else if (!have_prev || now_ms <= prev_ms) {
+            // No usable prior sample yet; just report the standing backlog.
+            ESP_LOGI(TAG, "Backlog: %s pending (trend pending)",
+                     human_bytes(backlog, b6, sizeof(b6)));
+        } else {
+            double secs = (double)(now_ms - prev_ms) / 1000.0;
+            // Signed delta: negative means the backlog shrank (we are catching up).
+            double delta = (double)backlog - (double)prev_backlog;
+            double rate = delta / secs;                 // bytes/sec, signed
+            double abs_rate = rate < 0 ? -rate : rate;
+            // Treat near-zero drift (< 1 KB/s) as holding steady to avoid noisy flip-flop.
+            if (abs_rate < 1024.0) {
+                ESP_LOGI(TAG, "Backlog: HOLDING at %s (~0 B/s)",
+                         human_bytes(backlog, b6, sizeof(b6)));
+            } else if (rate < 0) {
+                // Draining: ETA = remaining backlog / drain rate.
+                uint64_t eta_s = (uint64_t)((double)backlog / abs_rate);
+                ESP_LOGI(TAG, "Backlog: CATCHING UP, %s left, draining %s/s, ETA ~%llu s",
+                         human_bytes(backlog, b6, sizeof(b6)),
+                         human_bytes((uint64_t)abs_rate, b1, sizeof(b1)),
+                         (unsigned long long)eta_s);
+            } else {
+                ESP_LOGI(TAG, "Backlog: FALLING BEHIND, %s and growing %s/s",
+                         human_bytes(backlog, b6, sizeof(b6)),
+                         human_bytes((uint64_t)abs_rate, b1, sizeof(b1)));
+            }
+        }
+        prev_backlog = backlog;
+        prev_ms = now_ms;
+        have_prev = true;
+
+        ESP_LOGI(TAG, "Network: %s, Stream: %s, Retries: %d/%d",
                  g_state.network_healthy ? "OK" : "DOWN",
                  g_state.stream_healthy ? "OK" : "DOWN",
                  g_state.stream_retry_count, STREAM_MAX_RETRIES);
-        
-        // Add PSRAM usage info
+
+        // Lifetime fault counters: how rough the link has been since boot.
+        ESP_LOGI(TAG, "Faults: %lu stream failure(s), %lu SD fallback(s), %lu catch-up abort(s)",
+                 (unsigned long)g_total_stream_failures,
+                 (unsigned long)g_total_sd_fallbacks,
+                 (unsigned long)g_total_catchup_aborts);
+
+        // PSRAM usage info.
         size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
         size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-        ESP_LOGI(TAG, "PSRAM: %zu/%zu KB free (%.1f%% used)", 
+        ESP_LOGI(TAG, "PSRAM: %zu/%zu KB free (%.1f%% used)",
                  psram_free / 1024, psram_total / 1024,
                  ((psram_total - psram_free) * 100.0) / psram_total);
 
