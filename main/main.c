@@ -876,6 +876,9 @@ static esp_err_t sd_scan_buffered_files(void)
     
     if (file_count == 0) {
         closedir(dir);
+        // Authoritative: no backlog files on the card means zero bytes to catch up. This also
+        // corrects the counter if pre-existing files were cleared outside the live accounting.
+        g_state.sd_bytes_to_catch_up = 0;
         ESP_LOGI(TAG, "No buffered audio files found on SD card");
         return ESP_OK;
     }
@@ -893,6 +896,7 @@ static esp_err_t sd_scan_buffered_files(void)
     // Rewind directory and populate list
     rewinddir(dir);
     int index = 0;
+    uint64_t total_backlog_bytes = 0;   // sum of on-card backlog file sizes (authoritative)
     while ((entry = readdir(dir)) != NULL && index < file_count) {
         if (is_backlog_name(entry->d_name, &id)) {
             int ret = snprintf(full_path, sizeof(full_path), "%s/%s", MOUNT_POINT, entry->d_name);
@@ -908,6 +912,7 @@ static esp_err_t sd_scan_buffered_files(void)
                 // The 8-hex-digit base is the monotonic counter; it sorts chronologically.
                 g_state.sd_file_list[index].timestamp = (int64_t)id;
                 
+                total_backlog_bytes += (uint64_t)file_stat.st_size;
                 index++;
             }
         }
@@ -915,6 +920,12 @@ static esp_err_t sd_scan_buffered_files(void)
     
     closedir(dir);
     g_state.sd_file_count = index;
+
+    // The scan is the single source of truth for the backlog size: set the catch-up byte total
+    // to the exact sum of on-card backlog file sizes. This fixes the boot case (pre-existing
+    // files written by a prior run were never in the live += accounting) and prevents any drift
+    // between the incremental write/delete bookkeeping and what is actually on the card.
+    g_state.sd_bytes_to_catch_up = total_backlog_bytes;
     
     // Sort files by timestamp
     qsort(g_state.sd_file_list, g_state.sd_file_count, sizeof(sd_file_info_t), compare_files_by_timestamp);
@@ -1117,6 +1128,9 @@ static esp_err_t sd_write_audio_data(const uint8_t *data, size_t len)
         return ESP_FAIL;
     }
     
+    // Track bytes of the currently-open (not yet scannable) file for mid-burst responsiveness.
+    // sd_scan_buffered_files() resets this total to the sum of closed files on its next run, so
+    // this increment only ever represents the in-progress file and never double-counts.
     g_state.sd_bytes_to_catch_up += written;
     g_total_bytes_sd_written += written;
     g_state.sd_write_file_bytes += written;
@@ -1144,18 +1158,54 @@ static void catchup_delete_confirmed(void)
     if (!g_staged_uploaded || g_staged_count == 0) {
         return;
     }
+    // Note on sd_bytes_to_catch_up: no adjustment here. catchup_sd_phase() always rescans
+    // immediately after this delete pass, and sd_scan_buffered_files() recomputes the backlog
+    // total authoritatively from the files actually left on the card.
+#if SD_FILE_LIST_VERBOSE
+    // Verbose: one line per deleted file (original behavior).
     for (int i = 0; i < g_staged_count; i++) {
-        // Subtract the file's bytes from the catch-up total before removing it, so the stat
-        // reflects only data still awaiting confirmed delivery.
-        struct stat st;
-        if (stat(g_staged_files[i], &st) == 0) {
-            uint64_t fb = (uint64_t)st.st_size;
-            g_state.sd_bytes_to_catch_up = (g_state.sd_bytes_to_catch_up >= fb)
-                                         ? (g_state.sd_bytes_to_catch_up - fb) : 0;
-        }
         ESP_LOGI(TAG, "Deleting confirmed-sent file: %s", g_staged_files[i]);
         unlink(g_staged_files[i]);
     }
+#else
+    // Compact: collapse consecutive IDs into "[a..b] first ... last (N files)" lines, mirroring
+    // the backlog listing. g_staged_files is built oldest-first from the sorted scan, so it is
+    // already in ascending ID order. Parse each name's monotonic ID (from the basename) to find
+    // the runs; unlink within each run so deletion and logging stay together.
+    int i = 0;
+    while (i < g_staged_count) {
+        // Resolve the ID of run-start file i.
+        const char *base_i = strrchr(g_staged_files[i], '/');
+        base_i = base_i ? base_i + 1 : g_staged_files[i];
+        uint32_t id_i = 0;
+        bool have_i = is_backlog_name(base_i, &id_i);
+
+        int j = i;
+        // Extend the run while the next file's ID is exactly one greater. If any name fails to
+        // parse, we cannot prove contiguity, so the run stops there.
+        while (have_i && j + 1 < g_staged_count) {
+            const char *base_n = strrchr(g_staged_files[j + 1], '/');
+            base_n = base_n ? base_n + 1 : g_staged_files[j + 1];
+            uint32_t id_n = 0;
+            if (!is_backlog_name(base_n, &id_n)) break;
+            // id of file j is id_i + (j - i); next must be one past that.
+            if (id_n != id_i + (uint32_t)(j + 1 - i)) break;
+            j++;
+        }
+
+        if (j == i) {
+            ESP_LOGI(TAG, "Deleting confirmed-sent file: %s", g_staged_files[i]);
+        } else {
+            ESP_LOGI(TAG, "Deleting confirmed-sent files [%d..%d]: %s ... %s (%d files)",
+                     i, j, g_staged_files[i], g_staged_files[j], j - i + 1);
+        }
+        // Unlink every file in this run.
+        for (int k = i; k <= j; k++) {
+            unlink(g_staged_files[k]);
+        }
+        i = j + 1;
+    }
+#endif
     g_staged_count = 0;
     g_staged_bytes = 0;
     g_staged_uploaded = false;
@@ -1577,19 +1627,31 @@ static void log_halow_link(const char *context)
                 }
             }
             uint32_t ri = rc->rate_info[best];
-            uint32_t bw_field = (ri >> MMWLAN_RC_STATS_RATE_INFO_BW_OFFSET)    & 0xF;
+            // Field widths from the mmwlan.h bitfield diagram: BW occupies bits 0-3 but only
+            // uses values 0-2 (1/2/4 MHz), Rate (MCS) is bits 4-7, Guard is bit 8. Mask each
+            // to its own width so adjacent fields never leak in. BW masked to 2 bits is enough
+            // for 0-2; MCS masked to 4 bits.
+            uint32_t bw_field = (ri >> MMWLAN_RC_STATS_RATE_INFO_BW_OFFSET)    & 0x3;
             uint32_t mcs      = (ri >> MMWLAN_RC_STATS_RATE_INFO_RATE_OFFSET)  & 0xF;
             uint32_t sgi      = (ri >> MMWLAN_RC_STATS_RATE_INFO_GUARD_OFFSET) & 0x1;
             const char *bw_str = (bw_field == 0) ? "1MHz" :
                                  (bw_field == 1) ? "2MHz" :
-                                 (bw_field == 2) ? "4MHz" : "?MHz";
+                                 (bw_field == 2) ? "4MHz" : NULL;
             uint32_t sent = rc->total_sent[best];
             uint32_t succ = rc->total_success[best];
             unsigned succ_pct = (sent > 0) ? (unsigned)((uint64_t)succ * 100 / sent) : 0;
-            ESP_LOGI(TAG, "HaLow rate [%s]: MCS %lu, %s, %s GI, success %u%% (%lu/%lu pkts)",
-                     context,
-                     (unsigned long)mcs, bw_str, sgi ? "short" : "long",
-                     succ_pct, (unsigned long)succ, (unsigned long)sent);
+            if (bw_str) {
+                ESP_LOGI(TAG, "HaLow rate [%s]: MCS %lu, %s, %s GI, success %u%% (%lu/%lu pkts)",
+                         context,
+                         (unsigned long)mcs, bw_str, sgi ? "short" : "long",
+                         succ_pct, (unsigned long)succ, (unsigned long)sent);
+            } else {
+                // BW code outside the documented 0-2 range; surface it raw rather than hide it.
+                ESP_LOGI(TAG, "HaLow rate [%s]: MCS %lu, BW code %lu, %s GI, success %u%% (%lu/%lu pkts)",
+                         context,
+                         (unsigned long)mcs, (unsigned long)bw_field, sgi ? "short" : "long",
+                         succ_pct, (unsigned long)succ, (unsigned long)sent);
+            }
         }
         mmwlan_free_rc_stats(rc);
     }
@@ -2536,7 +2598,12 @@ static void print_statistics_task(void *arg)
 void app_main(void)
 {
     ESP_LOGI(TAG, "=== Robust Audio Streaming System Starting ===");
-    
+
+    // Silence the ESP-IDF gpio driver's per-pin INFO spam. Every SD mount/unmount reconfigures
+    // the shared-bus CS pins, which otherwise logs a GPIO[..] line per pin each cycle. Warnings
+    // and errors from the driver still come through.
+    esp_log_level_set("gpio", ESP_LOG_WARN);
+
     // Print PSRAM information first
     print_psram_info();
     
