@@ -149,6 +149,11 @@
 #define NVS_COUNTER_NAMESPACE       "wavstream"
 #define NVS_COUNTER_KEY             "filectr"
 #define NVS_COUNTER_BLOCK           256
+// Cached AP BSSID for fast directed reconnect (skips open scan during catch-up
+// ping-pong). Stored as a 6-byte blob in the same namespace / handle as the file
+// counter. Written ONLY when the live BSSID differs from the cached copy, so a stable
+// deployment performs zero NVS writes after the first-ever connect.
+#define NVS_BSSID_KEY               "ap_bssid"
 
 // Timing configuration (easily changeable)
 #define STREAM_RETRY_DELAY_MS       5000   // Delay between stream reconnection attempts
@@ -270,13 +275,13 @@ typedef struct {
 // Ring buffers in PSRAM
 static ring_buffer_t *g_incoming_buffer = NULL;
 // Flat catch-up stage buffer (formerly the unused "outgoing" ring). Holds one whole
-// SD file read off the card during the radio-off phase, then streamed out radio-on.
+// SD file read off the card during the radio-off phase, then streamed out radio-on. (outdated comment)
 static uint8_t *g_stage_buffer = NULL;
 
 // Catch-up staging state. g_staged_files holds the SD files currently sitting in
 // g_stage_buffer; once their bytes are confirmed sent (g_staged_uploaded), the next
 // SD phase deletes them. A whole file fits the stage 1:1, but smaller tail files may
-// let several fit, so this is a small list.
+// let several fit, so this is a small list. (outdated comment)
 #define CATCHUP_MAX_STAGED_FILES 8
 static char   g_staged_files[CATCHUP_MAX_STAGED_FILES][128];
 static int    g_staged_count = 0;
@@ -327,6 +332,14 @@ static bool                     g_netif_started = false;
 // STA args built once in halow_init_once(); reused by every halow_resume() so the
 // suspend/resume cycle never re-enters the one-shot mmhalow_init().
 static struct mmwlan_sta_args   g_sta_args = MMWLAN_STA_ARGS_INIT;
+// RAM mirror of the BSSID persisted in NVS. g_cached_bssid_valid is true once we have a
+// known-good BSSID (loaded from NVS at boot, or learned on a successful open connect).
+// g_bssid_pinned tracks whether the CURRENT g_sta_args.bssid is non-zero, so halow_resume()
+// knows whether a failure should clear the pin and fall back to an open scan.
+static uint8_t                  g_cached_bssid[MMWLAN_MAC_ADDR_LEN] = {0};
+static bool                     g_cached_bssid_valid = false;
+static bool                     g_bssid_pinned = false;
+static int                      g_pinned_fail_count = 0;
 
 // SD card variables
 static SemaphoreHandle_t spi_bus_mutex = NULL;
@@ -838,7 +851,72 @@ static esp_err_t file_counter_next(uint32_t *id_out)
     return ESP_OK;
 }
 
-// Build the full path "/sdcard/XXXXXXXX.bin" for a counter ID.
+// Load the cached AP BSSID from NVS into g_cached_bssid. Called once after the counter
+// NVS handle is open. Absence of the key (first ever boot) is not an error; we simply
+// leave g_cached_bssid_valid false and the first connect runs an open scan.
+static void bssid_cache_load(void)
+{
+    if (!g_ctr_nvs) {
+        return;
+    }
+    size_t len = MMWLAN_MAC_ADDR_LEN;
+    esp_err_t err = nvs_get_blob(g_ctr_nvs, NVS_BSSID_KEY, g_cached_bssid, &len);
+    if (err == ESP_OK && len == MMWLAN_MAC_ADDR_LEN) {
+        g_cached_bssid_valid = true;
+        ESP_LOGI(TAG, "Loaded cached BSSID %02x:%02x:%02x:%02x:%02x:%02x",
+                 g_cached_bssid[0], g_cached_bssid[1], g_cached_bssid[2],
+                 g_cached_bssid[3], g_cached_bssid[4], g_cached_bssid[5]);
+    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG, "No cached BSSID yet; first connect will scan");
+    } else {
+        ESP_LOGW(TAG, "BSSID cache load failed (%s); will scan", esp_err_to_name(err));
+    }
+}
+
+// Persist a freshly observed BSSID to NVS, but ONLY if it differs from the cached copy.
+// A stable AP therefore costs zero writes for the life of the deployment. Updates the RAM
+// mirror unconditionally so g_sta_args can be pinned from it next resume.
+static void bssid_cache_store(const uint8_t *bssid)
+{
+    if (g_cached_bssid_valid && memcmp(g_cached_bssid, bssid, MMWLAN_MAC_ADDR_LEN) == 0) {
+        return;   // unchanged: no flash write
+    }
+    memcpy(g_cached_bssid, bssid, MMWLAN_MAC_ADDR_LEN);
+    g_cached_bssid_valid = true;
+    if (!g_ctr_nvs) {
+        return;
+    }
+    esp_err_t err = nvs_set_blob(g_ctr_nvs, NVS_BSSID_KEY, g_cached_bssid, MMWLAN_MAC_ADDR_LEN);
+    if (err == ESP_OK) err = nvs_commit(g_ctr_nvs);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Cached new BSSID %02x:%02x:%02x:%02x:%02x:%02x",
+                 bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+    } else {
+        ESP_LOGW(TAG, "BSSID cache store failed: %s", esp_err_to_name(err));
+    }
+}
+
+// Drop a stale cached BSSID after a directed connect has repeatedly failed (e.g. the AP
+// moved or the device relocated). Clears RAM mirror, the live pin, and the NVS key so a
+// cold reboot does not keep chasing a dead BSSID.
+static void bssid_cache_invalidate(void)
+{
+    g_cached_bssid_valid = false;
+    memset(g_cached_bssid, 0, MMWLAN_MAC_ADDR_LEN);
+    memset(g_sta_args.bssid, 0, MMWLAN_MAC_ADDR_LEN);
+    g_bssid_pinned = false;
+    if (g_ctr_nvs) {
+        esp_err_t err = nvs_erase_key(g_ctr_nvs, NVS_BSSID_KEY);
+        if (err == ESP_OK) {
+            nvs_commit(g_ctr_nvs);
+            ESP_LOGW(TAG, "Invalidated cached BSSID; reverting to open scan");
+        } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(TAG, "BSSID cache erase failed: %s", esp_err_to_name(err));
+        }
+    }
+}
+
+
 static void backlog_path_from_id(uint32_t id, char *out, size_t out_sz)
 {
     snprintf(out, out_sz, MOUNT_POINT "/%08" PRIx32 ".bin", id);
@@ -1469,6 +1547,15 @@ static void halow_sta_status_cb(enum mmwlan_sta_state sta_state)
             break;
         case MMWLAN_STA_CONNECTED:
             ESP_LOGI(TAG, "HaLow STA connected");
+            {
+                // Learn the BSSID we actually associated with and persist it if changed.
+                // This is the only place the cache is updated; bssid_cache_store writes to
+                // NVS only on an actual change, so a stable AP never re-writes flash.
+                uint8_t bssid[MMWLAN_MAC_ADDR_LEN];
+                if (mmwlan_get_bssid(bssid) == MMWLAN_SUCCESS) {
+                    bssid_cache_store(bssid);
+                }
+            }
             if (g_halow_connected_sem) {
                 xSemaphoreGive(g_halow_connected_sem);
             }
@@ -1541,6 +1628,16 @@ static esp_err_t halow_init_once(void)
     memcpy(g_sta_args.passphrase, WIFI_PSK, strlen(WIFI_PSK));
     g_sta_args.passphrase_len = strlen(WIFI_PSK);
     g_sta_args.security_type = WIFI_SECURITY;
+
+    // Reduce the driver-internal connect-scan dwell to the SDK floor. With a pinned BSSID
+    // on a strong, fixed link this trims scan time off every catch-up resume; the open-scan
+    // fallback (see halow_resume) covers the rare case a short dwell misses the AP.
+    struct mmwlan_scan_config scan_cfg = MMWLAN_SCAN_CONFIG_INIT;
+    scan_cfg.dwell_time_ms = MMWLAN_SCAN_MIN_DWELL_TIME_MS;
+    enum mmwlan_status scfg = mmwlan_set_scan_config(&scan_cfg);
+    if (scfg != MMWLAN_SUCCESS) {
+        ESP_LOGW(TAG, "mmwlan_set_scan_config failed: %d (using default dwell)", scfg);
+    }
 
     // Also push the config into the driver/wrapper (keeps mmhalow_get_config consistent).
     mmhalow_wifi_config_t conf = { .sta = g_sta_args };
@@ -1678,6 +1775,18 @@ static esp_err_t halow_resume(void)
     // Drain any stale connect signal before issuing a fresh connect
     xSemaphoreTake(g_halow_connected_sem, 0);
 
+    // If we have a known-good BSSID, pin it so mmwlan_sta_enable connects directed instead
+    // of accepting any AP found in the scan. The scan still runs internally, but a pinned
+    // BSSID lets it settle on the right AP fast. Cleared below if the directed connect fails.
+    if (g_cached_bssid_valid) {
+        memcpy(g_sta_args.bssid, g_cached_bssid, MMWLAN_MAC_ADDR_LEN);
+        g_bssid_pinned = true;
+    } else {
+        memset(g_sta_args.bssid, 0, MMWLAN_MAC_ADDR_LEN);
+        g_bssid_pinned = false;
+    }
+
+    int64_t t_enable_start = esp_timer_get_time();
     enum mmwlan_status st = mmwlan_sta_enable(&g_sta_args, halow_sta_status_cb);
     if (st != MMWLAN_SUCCESS) {
         ESP_LOGE(TAG, "mmwlan_sta_enable failed: %d", st);
@@ -1688,8 +1797,26 @@ static esp_err_t halow_resume(void)
     if (xSemaphoreTake(g_halow_connected_sem, pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGE(TAG, "WiFi connection timeout");
         mmwlan_sta_disable();
+        // A directed (pinned) connect timed out. Drop the pin so the caller's retry runs an
+        // open scan, and after two consecutive pinned failures invalidate the cached BSSID
+        // entirely (AP likely moved/changed) so we stop chasing it across reboots.
+        if (g_bssid_pinned) {
+            g_pinned_fail_count++;
+            memset(g_sta_args.bssid, 0, MMWLAN_MAC_ADDR_LEN);
+            g_bssid_pinned = false;
+            if (g_pinned_fail_count >= 2) {
+                bssid_cache_invalidate();
+                g_pinned_fail_count = 0;
+            } else {
+                ESP_LOGW(TAG, "Directed connect timed out; retry will use open scan");
+            }
+        }
         return ESP_FAIL;
     }
+    ESP_LOGI(TAG, "sta_enable->connected in %lld ms (%s)",
+             (esp_timer_get_time() - t_enable_start) / 1000,
+             g_bssid_pinned ? "directed" : "open scan");
+    g_pinned_fail_count = 0;   // any successful connect clears the directed-failure tally
 
     // Disable power save (these survive from morselib via mmhalow.h)
     mmwlan_set_power_save_mode(MMWLAN_PS_DISABLED);
@@ -2526,6 +2653,10 @@ static void initialize_system(void)
     if (file_counter_init() != ESP_OK) {
         ESP_LOGE(TAG, "File counter init failed; SD buffering will not be able to name files");
     }
+
+    // Load any cached AP BSSID (shares the counter's NVS handle, so must run after
+    // file_counter_init). Enables directed reconnect on the very first catch-up cycle.
+    bssid_cache_load();
 
     // Initialize HaLow module (netif, driver, STA config)
     ESP_LOGI(TAG, "Initializing HaLow module...");
