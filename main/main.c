@@ -70,9 +70,7 @@
 #include "usb/usb_types_ch9.h"
 
 #include "driver/gpio.h"
-#include "esp_rom_gpio.h"
 #include "hal/gpio_types.h"
-#include "soc/gpio_sig_map.h"
 
 #include <sys/unistd.h>
 #include <sys/stat.h>
@@ -87,7 +85,6 @@
 #define PIN_SD_MOSI 9
 #define PIN_SD_CLK  7
 #define PIN_SD_CS   21
-#define PIN_MIRROR_CS 6
 
 #define MOUNT_POINT "/sdcard"
 
@@ -767,15 +764,6 @@ static const esp_vfs_fat_sdmmc_mount_config_t sd_mount_config = {
     .max_files = 5,
     .allocation_unit_size = 16 * 1024
 };
-
-static void setup_gpio_mirroring(void)
-{
-    ESP_LOGI(TAG, "Setting up GPIO 6 to mirror GPIO 21");
-    gpio_set_direction(PIN_SD_CS, GPIO_MODE_INPUT_OUTPUT);
-    gpio_set_direction(PIN_MIRROR_CS, GPIO_MODE_OUTPUT);
-    esp_rom_gpio_connect_out_signal(PIN_MIRROR_CS, 0x100 + PIN_SD_CS, false, false);
-    ESP_LOGI(TAG, "GPIO 6 now mirrors GPIO 21 continuously");
-}
 
 static void force_halow_cs_high(void)
 {
@@ -2705,9 +2693,6 @@ static void initialize_system(void)
         ESP_LOGE(TAG, "Failed to create SPI bus mutex");
         return;
     }
-    
-    // Set up GPIO mirroring
-    setup_gpio_mirroring();
     
     // (event loop is created inside halow_init_once, which owns netif/event-loop setup)
     
