@@ -150,6 +150,17 @@
 #define NETWORK_CHECK_INTERVAL_MS   20000  // Check network every 20 seconds when on SD
 #define STREAM_HEALTH_CHECK_MS      10000  // Check stream health every 10 seconds
 
+// Zero-loss stream failover: when the live stream fails, re-probe the link quickly instead
+// of blocking, and abandon to SD the instant the incoming ring nears full so audio is never
+// lost to overflow.
+#define RECONNECT_PROBE_TIMEOUT_MS   1000  // short per-probe connect timeout (re-probe often)
+#define RECONNECT_PROBE_GAP_MS        200  // brief pause between probes
+// High-water on the incoming ring. Crossing it while the stream is down forces an immediate
+// switch to SD. 60% of the 2.5 MB ring leaves ~1 MB (~11 s at 96 KB/s) of headroom, far more
+// than one probe (<=1 s) plus the SD mount (~0.5 s), so the ring never reaches capacity.
+#define STREAM_FAIL_SD_HIGHWATER_NUM   60
+#define STREAM_FAIL_SD_HIGHWATER_DEN  100
+
 // Audio data rate: 96 bytes/ms = 96KB/s = 768kbps
 #define AUDIO_DATA_RATE_BPS         768000
 #define AUDIO_BYTES_PER_MS          96
@@ -276,6 +287,9 @@ static system_state_t g_state = {
 
 // Streaming context
 static streaming_context_t stream_ctx = {0};
+// Connect timeout for the streaming HTTP client. Lowered transiently during the zero-loss
+// failover probe loop so a dead endpoint is given up on fast and the link is re-probed often.
+static int g_stream_connect_timeout_ms = 5000;
 
 // USB variables
 static usb_host_client_handle_t g_client;
@@ -325,6 +339,7 @@ static void run_catchup_cycle(uint8_t *work_buffer);
 static esp_err_t switch_to_streaming_mode(void);
 static esp_err_t switch_to_sd_mode(void);
 static esp_err_t switch_to_catchup_mode(void);
+static void handle_stream_failure(void);
 static esp_err_t wifi_reconnect(void);
 
 /* ========================== Ring Buffer Functions ========================== */
@@ -532,7 +547,7 @@ static esp_err_t stream_connect(void)
     esp_http_client_config_t config = {
         .url = url,
         .method = HTTP_METHOD_POST,
-        .timeout_ms = 5000,
+        .timeout_ms = g_stream_connect_timeout_ms,
         .buffer_size = 1024,
         .buffer_size_tx = 1024,
     };
@@ -1539,29 +1554,6 @@ static bool check_network_health(void)
 
 /* ========================== Mode Management ========================== */
 
-static esp_err_t attempt_stream_reconnection(void)
-{
-    ESP_LOGI(TAG, "Attempting to reconnect stream (attempt %d/%d)", 
-             g_state.stream_retry_count + 1, STREAM_MAX_RETRIES);
-    
-    // Disconnect existing stream
-    stream_disconnect();
-    
-    // Wait before retry
-    vTaskDelay(pdMS_TO_TICKS(STREAM_RETRY_DELAY_MS));
-    
-    // Try to reconnect
-    if (stream_connect() == ESP_OK) {
-        ESP_LOGI(TAG, "Stream reconnection successful");
-        g_state.stream_retry_count = 0;
-        g_state.stream_healthy = true;
-        return ESP_OK;
-    }
-    
-    g_state.stream_retry_count++;
-    return ESP_FAIL;
-}
-
 static esp_err_t switch_to_streaming_mode(void)
 {
     ESP_LOGI(TAG, "Switching to STREAMING mode");
@@ -1637,6 +1629,51 @@ static esp_err_t switch_to_sd_mode(void)
     return ESP_OK;
 }
 
+// Stream just failed. Re-probe the link quickly and repeatedly while watching the incoming
+// ring. The instant the ring crosses the high-water mark we stop probing and switch to SD,
+// which drains the ring far faster than USB fills it. With ~11 s of headroom above the mark
+// and a probe+switch costing a few seconds at most, the ring can never reach capacity, so no
+// audio is lost to a network outage (assumes SD is healthy and writes faster than inflow,
+// which it does by ~8x). The unsent block stays at the head of the ring and resends on resume.
+static void handle_stream_failure(void)
+{
+    const size_t highwater =
+        (size_t)((uint64_t)PSRAM_INCOMING_BUFFER_SIZE * STREAM_FAIL_SD_HIGHWATER_NUM
+                 / STREAM_FAIL_SD_HIGHWATER_DEN);
+
+    g_state.stream_healthy = false;
+    stream_disconnect();
+
+    const int saved_timeout = g_stream_connect_timeout_ms;
+    g_stream_connect_timeout_ms = RECONNECT_PROBE_TIMEOUT_MS;
+
+    int probe = 0;
+    while (1) {
+        const size_t fill = ring_buffer_get_data_size(g_incoming_buffer);
+        if (fill >= highwater) {
+            ESP_LOGW(TAG, "Stream down, ring %zu/%zu (>=%d%%); switching to SD to avoid loss",
+                     fill, (size_t)PSRAM_INCOMING_BUFFER_SIZE,
+                     (STREAM_FAIL_SD_HIGHWATER_NUM * 100) / STREAM_FAIL_SD_HIGHWATER_DEN);
+            break;
+        }
+
+        probe++;
+        ESP_LOGI(TAG, "Stream reconnect probe %d (ring %zu/%zu)",
+                 probe, fill, (size_t)PSRAM_INCOMING_BUFFER_SIZE);
+        if (stream_connect() == ESP_OK) {
+            ESP_LOGI(TAG, "Stream recovered after %d probe(s); resuming STREAMING", probe);
+            g_state.stream_healthy = true;
+            g_state.stream_retry_count = 0;
+            g_stream_connect_timeout_ms = saved_timeout;
+            return;  // back to the STREAMING loop; the unsent block resends
+        }
+        vTaskDelay(pdMS_TO_TICKS(RECONNECT_PROBE_GAP_MS));
+    }
+
+    g_stream_connect_timeout_ms = saved_timeout;
+    switch_to_sd_mode();
+}
+
 static esp_err_t switch_to_catchup_mode(void)
 {
     ESP_LOGI(TAG, "Switching to CATCHING_UP mode");
@@ -1703,21 +1740,11 @@ static void stream_manager_task(void *arg)
                             // Reset retry count on successful send
                             g_state.stream_retry_count = 0;
                         } else {
-                            // Stream failed; leave the block in the ring (not consumed) and
-                            // try to reconnect. The same block is re-sent on the next pass.
-                            ESP_LOGE(TAG, "Stream write failed (retry %d/%d)", g_state.stream_retry_count, STREAM_MAX_RETRIES);
-                            g_state.stream_healthy = false;
-                            
-                            if (g_state.stream_retry_count < STREAM_MAX_RETRIES) {
-                                if (attempt_stream_reconnection() != ESP_OK) {
-                                    if (g_state.stream_retry_count >= STREAM_MAX_RETRIES) {
-                                        ESP_LOGE(TAG, "Max stream retry attempts reached, switching to SD mode");
-                                        switch_to_sd_mode();
-                                    }
-                                }
-                            } else {
-                                switch_to_sd_mode();
-                            }
+                            // Stream failed. The unsent block stays at the head of the ring.
+                            // Hand off to zero-loss failover: re-probe fast, and bail to SD the
+                            // instant the ring nears full so nothing is lost to overflow.
+                            ESP_LOGW(TAG, "Stream write failed; entering zero-loss failover");
+                            handle_stream_failure();
                         }
                     }
                 } else {
