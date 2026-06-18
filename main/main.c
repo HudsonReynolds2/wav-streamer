@@ -112,13 +112,14 @@
 // a larger batch. The stage buffer holds 5 MB (up to five 1 MB files), so each radio bring-up
 // sends 5 MB instead of 3, raising net drain. SD files stay 1 MB so several stage together.
 //
-// The incoming ring is 2.5 MB. During a catch-up radio phase the ring is not drained (the bus
-// belongs to the radio); when it crosses the abort threshold below we flip back to an SD phase
-// and write out ~2 full 1 MB files, with the remaining ~0.5 MB of ring covering the audio that
-// keeps arriving during the mount/suspend transition itself. 2.5 MB ÷ 96 KB/s ≈ 26 s of live
-// headroom, and the ring is drained to SD at the start of every cycle so it begins near empty.
-#define PSRAM_INCOMING_BUFFER_SIZE  (5 * 512 * 1024)   // 2.5MB incoming USB ring (~26s)
-#define PSRAM_STAGE_BUFFER_SIZE     (5 * 1024 * 1024)  // 5MB catch-up stage (up to five files)
+// Buffer configuration
+// Rebalanced after measuring real link behavior: send rate ~311 KB/s (2.5 Mbps) when the
+// link is healthy, but the HaLow link stalls intermittently. A larger incoming ring buys
+// more seconds of dropout tolerance before the catch-up abort triggers; the stage shrinks
+// to match so total PSRAM stays within budget. 4 MB ring + 3.5 MB stage = 7.5 MB (same as
+// before), but the headroom now sits where the link needs it.
+#define PSRAM_INCOMING_BUFFER_SIZE  (8 * 512 * 1024)   // 4MB incoming USB ring (~43s headroom)
+#define PSRAM_STAGE_BUFFER_SIZE     (7 * 512 * 1024)   // 3.5MB catch-up stage (up to seven 512KB-equiv, ~3-4 files)
 #define SD_BLOCK_SIZE               (32 * 1024)        // 32KB blocks for SD writes / frames
 #define SD_MAX_WRITE_SIZE           (128 * 1024)       // Max 128KB per SD write operation
 
@@ -128,10 +129,10 @@
 // multiple of SD_BLOCK_SIZE (1MB / 32KB = 32) and of the 512-byte sector size.
 #define SD_FILE_SIZE                (1 * 1024 * 1024)
 
-// During a catch-up radio phase the incoming ring is not being drained. If it climbs past this
-// fraction of capacity we abort the upload early and flip back to an SD phase to drain it, so
-// live audio is never lost to overflow. 80% of the 2.5 MB ring = 2 MB, i.e. two full 1 MB
-// files' worth, leaving the remaining 0.5 MB to absorb audio arriving during the transition.
+// 80% of the 4 MB ring = 3.2 MB of headroom before abort. At the 96 KB/s capture rate that is
+// ~34 s, comfortably longer than the ~11 s it takes to send the 3.5 MB stage at the measured
+// 311 KB/s, so a healthy link clears a full stage without ever tripping the abort. The margin
+// also absorbs multi-second link stalls that would previously have overflowed the ring.
 #define CATCHUP_INCOMING_ABORT_NUM  80
 #define CATCHUP_INCOMING_ABORT_DEN  100
 
