@@ -168,6 +168,13 @@
 // than one probe (<=1 s) plus the SD mount (~0.5 s), so the ring never reaches capacity.
 #define STREAM_FAIL_SD_HIGHWATER_NUM   60
 #define STREAM_FAIL_SD_HIGHWATER_DEN  100
+// Live-reconnect blackhole bailout. A live failover (radio already up) normally reconnects in
+// well under a second; a long run of connect timeouts means the path is blackholed (e.g. a
+// server/NAT conntrack entry stuck after an RST), not ramping. Bail to SD after this many
+// consecutive failures so the SD fallback's radio teardown forces a fresh association and
+// clears the blackhole, instead of probing all the way to the high-water mark. ~5 x (timeout
+// + gap) to bail vs ~25 s to fill the ring.
+#define STREAM_FAIL_MAX_PROBES  5
 
 // First-connect warm-up. After a fresh radio bring-up the HaLow rate controller sits at
 // MCS0/1MHz and has not adapted, so the opening TCP SYN frequently times out for a second or
@@ -180,6 +187,15 @@
 // attempt also re-sends SYNs, which is the very traffic that ramps the link (an idle settle
 // delay would not, since rate control only adapts when frames flow).
 #define STREAM_CONNECT_WARMUP_ATTEMPTS  4
+
+// Transport timeout for the live connection once it is open. esp_http_client uses one
+// timeout_ms for both the connect (select) and the data phase, and reads it at every
+// esp_http_client_write(). The warm-up path drops the connect timeout to fail fast and
+// retry, so without this the data phase would inherit that short value and abort a 32 KB
+// write (and the whole catch-up batch) on any brief HaLow stall. Bump the timeout back up
+// after the socket opens. Matches the pre-warm-up default so live/catch-up writes ride out
+// stalls as before.
+#define STREAM_DATA_TIMEOUT_MS  5000
 
 // Audio data rate: 96 bytes/ms = 96KB/s = 768kbps
 #define AUDIO_DATA_RATE_BPS         768000
@@ -641,6 +657,11 @@ static esp_err_t stream_connect(void)
     }
 
     stream_ctx.is_connected = true;
+    
+    // The connect may have used a short warm-up timeout (fast-fail + retry on a cold link).
+    // Now that the socket is open, restore a generous data-phase timeout so a transient stall
+    // does not abort a write mid-batch. Applies to every connect path, not just warm-up.
+    esp_http_client_set_timeout_ms(stream_ctx.client, STREAM_DATA_TIMEOUT_MS);
     
     // Reset sequence number on new connection
     g_state.sequence_number = 0;
@@ -2034,6 +2055,7 @@ static void handle_stream_failure(void)
     g_stream_connect_timeout_ms = RECONNECT_PROBE_TIMEOUT_MS;
 
     int probe = 0;
+    int fails = 0;
     while (1) {
         const size_t fill = ring_buffer_get_data_size(g_incoming_buffer);
         if (fill >= highwater) {
@@ -2052,6 +2074,11 @@ static void handle_stream_failure(void)
             g_state.stream_retry_count = 0;
             g_stream_connect_timeout_ms = saved_timeout;
             return;  // back to the STREAMING loop; the unsent block resends
+        }
+        if (++fails >= STREAM_FAIL_MAX_PROBES) {
+            ESP_LOGW(TAG, "Stream reconnect blackholed (%d consecutive fails); switching to SD to re-associate",
+                     fails);
+            break;
         }
         vTaskDelay(pdMS_TO_TICKS(RECONNECT_PROBE_GAP_MS));
     }
