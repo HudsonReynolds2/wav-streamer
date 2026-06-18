@@ -1634,9 +1634,11 @@ static void log_halow_link(const char *context)
             uint32_t bw_field = (ri >> MMWLAN_RC_STATS_RATE_INFO_BW_OFFSET)    & 0x3;
             uint32_t mcs      = (ri >> MMWLAN_RC_STATS_RATE_INFO_RATE_OFFSET)  & 0xF;
             uint32_t sgi      = (ri >> MMWLAN_RC_STATS_RATE_INFO_GUARD_OFFSET) & 0x1;
+            // BW codes: 0=1MHz, 1=2MHz, 2=4MHz, 3=8MHz. Anything else is surfaced raw below.
             const char *bw_str = (bw_field == 0) ? "1MHz" :
                                  (bw_field == 1) ? "2MHz" :
-                                 (bw_field == 2) ? "4MHz" : NULL;
+                                 (bw_field == 2) ? "4MHz" :
+                                 (bw_field == 3) ? "8MHz" : NULL;
             uint32_t sent = rc->total_sent[best];
             uint32_t succ = rc->total_success[best];
             unsigned succ_pct = (sent > 0) ? (unsigned)((uint64_t)succ * 100 / sent) : 0;
