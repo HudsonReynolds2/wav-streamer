@@ -5,6 +5,43 @@
 // dependencies (a struct layout, a field name, an SDK API signature, whether a symbol
 // exists), do NOT guess. Write the grep/find command that would resolve it and hand it to
 // me to run; I will paste back the output. Certainty over speed.
+
+/*hudsonre@enterprise:/mnt/c/Users/hudsonre/Desktop/BU/chameleon/wav-streamer/wav-streamer$ tree -L 3 -I "build"
+.
+├── CMakeLists.txt
+├── dependencies.lock
+├── main
+│   ├── CMakeLists.txt
+│   ├── Kconfig.projbuild
+│   ├── idf_component.yml
+│   └── main.c
+├── managed_components
+│   ├── morsemicro__firmware
+│   │   ├── CHECKSUMS.json
+│   │   ├── CMakeLists.txt
+│   │   ├── Kconfig
+│   │   ├── README.md
+│   │   ├── REUSE.toml
+│   │   ├── idf_component.yml
+│   │   ├── mm6108
+│   │   └── mm8108
+│   └── morsemicro__halow
+│       ├── CHECKSUMS.json
+│       ├── CMakeLists.txt
+│       ├── Kconfig
+│       ├── components
+│       ├── examples
+│       ├── idf_component.yml
+│       ├── mmhalow.c
+│       └── mmhalow.h
+├── sdkconfig
+├── sdkconfig.defaults
+└── sdkconfig.old
+
+9 directories, 21 files
+hudsonre@enterprise:/mnt/c/Users/hudsonre/Desktop/BU/chameleon/wav-streamer/wav-streamer$ 
+*/
+
 //
 // ============================================================================
 //  HARDWARE CONSTRAINT: SD CARD AND HaLow RADIO SHARE ONE SPI BUS.
@@ -198,8 +235,8 @@
 #define STREAM_DATA_TIMEOUT_MS  5000
 
 // Audio data rate: 96 bytes/ms = 96KB/s = 768kbps
-#define AUDIO_DATA_RATE_BPS         768000
-#define AUDIO_BYTES_PER_MS          96
+#define AUDIO_DATA_RATE_BPS    768000
+#define AUDIO_BYTES_PER_MS     96
 
 // USB configuration
 #define ISO_MPS              96
@@ -223,13 +260,13 @@
 // is almost always one long run. Set to 1 to print one line per file (old behavior);
 // set to 0 to collapse each run of consecutive IDs into a single "[a..b] first ... last
 // (N files)" line. Singletons and gaps still print on their own line.
-#define SD_FILE_LIST_VERBOSE        0
+#define SD_FILE_LIST_VERBOSE   0
 
 // Include the negotiated HaLow TX rate / MCS in the link status line. This calls
 // mmwlan_get_rc_stats(), which allocates a struct on the heap that must be freed. The struct
 // layout has been verified against this SDK's mmwlan.h (see log_halow_link). Set to 0 to drop
 // the TX-rate line and report only RSSI/state/IP.
-#define HALOW_REPORT_TX_RATE        1
+#define HALOW_REPORT_TX_RATE   1
 
 static const char *TAG = "wav-streamer";
 
@@ -451,14 +488,10 @@ static ring_buffer_t* ring_buffer_create(size_t capacity)
     rb->buffer = (uint8_t*)heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM);
     if (!rb->buffer) {
         ESP_LOGE(TAG, "Failed to allocate %zu bytes in PSRAM", capacity);
-        // Try internal RAM as fallback (though likely to fail for large sizes)
-        rb->buffer = (uint8_t*)heap_caps_malloc(capacity, MALLOC_CAP_INTERNAL);
         if (!rb->buffer) {
-            ESP_LOGE(TAG, "Failed to allocate %zu bytes in internal RAM either", capacity);
             free(rb);
             return NULL;
         }
-        ESP_LOGW(TAG, "Allocated %zu bytes in internal RAM (fallback)", capacity);
     } else {
         ESP_LOGI(TAG, "Successfully allocated %zu bytes in PSRAM", capacity);
     }
