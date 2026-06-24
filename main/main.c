@@ -6,7 +6,7 @@
 // exists), do NOT guess. Write the grep/find command that would resolve it and hand it to
 // me to run; I will paste back the output. Certainty over speed.
 
-/*hudsonre@enterprise:/mnt/c/Users/hudsonre/Desktop/BU/chameleon/wav-streamer/wav-streamer$ tree -L 3 -I "build"
+/*
 .
 ├── CMakeLists.txt
 ├── dependencies.lock
@@ -37,9 +37,6 @@
 ├── sdkconfig
 ├── sdkconfig.defaults
 └── sdkconfig.old
-
-9 directories, 21 files
-hudsonre@enterprise:/mnt/c/Users/hudsonre/Desktop/BU/chameleon/wav-streamer/wav-streamer$ 
 */
 
 //
@@ -118,9 +115,9 @@ hudsonre@enterprise:/mnt/c/Users/hudsonre/Desktop/BU/chameleon/wav-streamer/wav-
 
 /* ========================== Configuration Defines ========================== */
 
-#define PIN_SD_MISO 8
-#define PIN_SD_MOSI 9
-#define PIN_SD_CLK  7
+#define PIN_SD_MISO 8  // Shared with HaLow modem
+#define PIN_SD_MOSI 9  // Shared with HaLow modem
+#define PIN_SD_CLK  7  // Shared with HaLow modem
 #define PIN_SD_CS   21
 
 #define MOUNT_POINT "/sdcard"
@@ -130,7 +127,7 @@ hudsonre@enterprise:/mnt/c/Users/hudsonre/Desktop/BU/chameleon/wav-streamer/wav-
 #define LISTENER_ID         "esp32_01_outdoor_test"
 #define WIFI_CONNECT_TIMEOUT_MS  10000  // 10 seconds timeout for WiFi connection
 
-// HaLow STA credentials (set to match your Heltec H7608 AP)
+// HaLow STA credentials (set to match Heltec H7608 AP)
 #define WIFI_SSID           "HT-H7608-B81E"
 #define WIFI_PSK            "blacksmith"
 // Security: MMWLAN_SAE (WPA3), MMWLAN_OWE, or MMWLAN_OPEN
@@ -139,10 +136,9 @@ hudsonre@enterprise:/mnt/c/Users/hudsonre/Desktop/BU/chameleon/wav-streamer/wav-
 // Static IP configuration. The old v5.1.1 build used a static IP; the new esp_netif path
 // defaults to a DHCP client, which gets no lease on this AP and leaves the interface at
 // 0.0.0.0 (cause of "Host is unreachable"). Set these to the device's static addressing.
-// !!! SET WIFI_STATIC_IP to the address this device used in the old build !!!
-#define WIFI_STATIC_IP      "192.168.100.150"   // <-- CHANGE to the ESP's static IP
-#define WIFI_STATIC_GW      "192.168.100.1"     // gateway (confirmed)
-#define WIFI_STATIC_NETMASK "255.255.255.0"     // /24, adjust if your subnet differs
+#define WIFI_STATIC_IP      "192.168.100.150"   // ESP's static IP
+#define WIFI_STATIC_GW      "192.168.100.1"     // gateway
+#define WIFI_STATIC_NETMASK "255.255.255.0"     // /24, adjust if subnet differs
 
 // Buffer configuration (easily changeable)
 //
